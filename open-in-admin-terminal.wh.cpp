@@ -6,7 +6,7 @@
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
-// @compilerOptions -lole32 -loleaut32 -luuid -lshlwapi -lshell32
+// @compilerOptions -lole32 -loleaut32 -luuid -lshlwapi -lshell32 -lgdi32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -77,6 +77,7 @@ Notes:
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <exdisp.h>
+#include <shellapi.h>
 
 #include <string>
 #include <utility>
@@ -115,6 +116,7 @@ static const UINT kMenuCommandId = 0xBF31;
 static thread_local HWND g_currentMenuHwnd = nullptr;
 static thread_local bool g_currentMenuEligible = false;
 static thread_local MenuTarget g_currentTarget;
+static thread_local HBITMAP g_currentMenuBitmap = nullptr;
 
 using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
 static TrackPopupMenuEx_t TrackPopupMenuEx_Orig;
@@ -494,7 +496,119 @@ static Settings GetSettingsSnapshot() {
     return snapshot;
 }
 
+static std::wstring TrimQuotes(const std::wstring& v) {
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"') {
+        return v.substr(1, v.size() - 2);
+    }
+    return v;
+}
+
+static bool ResolveExecutablePathForIcon(const Settings& settings, std::wstring& exeOut) {
+    exeOut.clear();
+
+    if (settings.terminalChoice == L"wt") {
+        exeOut = L"wt.exe";
+    } else if (settings.terminalChoice == L"pwsh") {
+        exeOut = L"pwsh.exe";
+    } else if (settings.terminalChoice == L"powershell") {
+        exeOut = L"powershell.exe";
+    } else if (settings.terminalChoice == L"cmd") {
+        exeOut = L"cmd.exe";
+    } else if (settings.terminalChoice == L"custom") {
+        std::wstring candidate = TrimQuotes(TrimString(settings.customTerminalCommand));
+        if (candidate.empty()) {
+            return false;
+        }
+        DWORD attrs = GetFileAttributesW(candidate.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            exeOut = candidate;
+            return true;
+        }
+        return false;
+    } else {
+        return false;
+    }
+
+    WCHAR resolved[MAX_PATH] = {};
+    DWORD len = SearchPathW(nullptr, exeOut.c_str(), nullptr, ARRAYSIZE(resolved), resolved,
+                            nullptr);
+    if (len == 0 || len >= ARRAYSIZE(resolved)) {
+        return false;
+    }
+    exeOut = resolved;
+    return true;
+}
+
+static HBITMAP CreateMenuBitmapFromIcon(HICON icon) {
+    if (!icon) {
+        return nullptr;
+    }
+
+    const int size = GetSystemMetrics(SM_CXMENUCHECK);
+    if (size <= 0) {
+        return nullptr;
+    }
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc) {
+        return nullptr;
+    }
+    HBITMAP bitmap = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap) {
+        ReleaseDC(nullptr, screenDc);
+        return nullptr;
+    }
+
+    HDC memDc = CreateCompatibleDC(screenDc);
+    if (!memDc) {
+        DeleteObject(bitmap);
+        ReleaseDC(nullptr, screenDc);
+        return nullptr;
+    }
+
+    if (bits) {
+        ZeroMemory(bits, static_cast<SIZE_T>(size) * static_cast<SIZE_T>(size) * 4);
+    }
+    HGDIOBJ oldBitmap = SelectObject(memDc, bitmap);
+    DrawIconEx(memDc, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL);
+    SelectObject(memDc, oldBitmap);
+
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+    return bitmap;
+}
+
+static HBITMAP TryCreateMenuBitmapForTerminal(const Settings& settings) {
+    std::wstring exePath;
+    if (!ResolveExecutablePathForIcon(settings, exePath)) {
+        return nullptr;
+    }
+
+    SHFILEINFOW shfi = {};
+    if (!SHGetFileInfoW(exePath.c_str(), FILE_ATTRIBUTE_NORMAL, &shfi, sizeof(shfi),
+                        SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)) {
+        return nullptr;
+    }
+
+    HBITMAP bitmap = CreateMenuBitmapFromIcon(shfi.hIcon);
+    DestroyIcon(shfi.hIcon);
+    return bitmap;
+}
+
 static void ClearCurrentMenuState() {
+    if (g_currentMenuBitmap) {
+        DeleteObject(g_currentMenuBitmap);
+        g_currentMenuBitmap = nullptr;
+    }
     g_currentMenuEligible = false;
     g_currentTarget = {};
     g_currentMenuHwnd = nullptr;
@@ -540,6 +654,23 @@ static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings) {
         InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_STRING, kMenuCommandId,
                     settings.menuText.c_str());
         InsertMenuW(menu, insertPos + 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    }
+
+    g_currentMenuBitmap = TryCreateMenuBitmapForTerminal(settings);
+    if (g_currentMenuBitmap) {
+        MENUITEMINFOW itemInfo = {};
+        itemInfo.cbSize = sizeof(itemInfo);
+        itemInfo.fMask = MIIM_BITMAP;
+        itemInfo.hbmpItem = g_currentMenuBitmap;
+        if (!SetMenuItemInfoW(menu, kMenuCommandId, FALSE, &itemInfo)) {
+            DeleteObject(g_currentMenuBitmap);
+            g_currentMenuBitmap = nullptr;
+            DEBUG_LOG(settings, L"Menu icon assignment failed");
+        } else {
+            DEBUG_LOG(settings, L"Menu icon assigned");
+        }
+    } else {
+        DEBUG_LOG(settings, L"Menu icon unavailable");
     }
 }
 
