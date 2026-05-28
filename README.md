@@ -23,6 +23,8 @@
 
 *Settings panel — choose terminal, customize label, toggle terminal name appending*
 
+Screenshots may show earlier builds, but current releases use runtime classic-menu injection. The mod does not write Explorer context menu entries to the registry.
+
 ## Files
 
 - `open-in-admin-terminal.wh.cpp` — Windhawk mod source
@@ -37,6 +39,11 @@
 ## Notes
 
 - On Windows 11, Explorer may place this entry under `Show more options` depending on your context menu setup.
-- Shell entries are registered when the mod is enabled and removed when it is disabled — no manual cleanup needed.
-- For the Windows Terminal option, the mod resolves the real installed executable for the icon and falls back gracefully if not found.
-- For a custom terminal command, that command is also used as the icon source.
+- The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
+- The mod intentionally targets filesystem folders and drive roots only.
+- Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
+
+## Version log
+
+- 1.9: Added quiet-by-default debug logging, improved menu placement, tightened filesystem target eligibility, and refreshed docs for classic-menu runtime injection.
+- 1.8: Switched to direct Explorer classic-menu injection with no persistent registry writes.

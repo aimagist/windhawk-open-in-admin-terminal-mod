@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.8
+// @version         1.9
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -67,6 +67,9 @@ Notes:
 - appendTerminalName: false
   $name: Append terminal name
   $description: When Menu text is set, append the selected terminal name in parentheses.
+- debugLogging: false
+  $name: Debug logging
+  $description: Log target detection, injection decisions, and successful launches.
 */
 // ==/WindhawkModSettings==
 
@@ -89,6 +92,7 @@ struct Settings {
     bool showOnFolderItem;
     bool showOnDriveItem;
     std::wstring position;
+    bool debugLogging;
 };
 
 enum class TargetKind {
@@ -131,6 +135,13 @@ static bool GetSettingBool(PCWSTR name) {
     return Wh_GetIntSetting(name) != 0;
 }
 
+#define DEBUG_LOG(settings, ...) \
+    do {                         \
+        if ((settings).debugLogging) { \
+            Wh_Log(__VA_ARGS__); \
+        }                        \
+    } while (false)
+
 static std::wstring TrimString(const std::wstring& v) {
     auto first = v.find_first_not_of(L" \t\r\n");
     if (first == std::wstring::npos) {
@@ -167,6 +178,7 @@ static Settings LoadSettings() {
     s.showOnFolderItem = GetSettingBool(L"showOnFolderItem");
     s.showOnDriveItem = GetSettingBool(L"showOnDriveItem");
     s.position = GetSettingString(L"position", L"Top");
+    s.debugLogging = GetSettingBool(L"debugLogging");
 
     if (s.terminalChoice == L"wt") {
         s.terminalDisplayCommand = L"wt.exe";
@@ -201,6 +213,19 @@ static bool IsTargetEnabled(const Settings& s, TargetKind kind) {
         return s.showOnDriveItem;
     }
     return false;
+}
+
+static PCWSTR TargetKindName(TargetKind kind) {
+    if (kind == TargetKind::FolderBackground) {
+        return L"folder-background";
+    }
+    if (kind == TargetKind::FolderItem) {
+        return L"folder-item";
+    }
+    if (kind == TargetKind::DriveItem) {
+        return L"drive-item";
+    }
+    return L"none";
 }
 
 static bool IsDirectoryPath(const std::wstring& path) {
@@ -478,21 +503,42 @@ static void ClearCurrentMenuState() {
 static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings) {
     int itemCount = GetMenuItemCount(menu);
     int insertPos = 0;
-    bool insertAtEnd = false;
+    bool separatorAbove = false;
 
     if (_wcsicmp(settings.position.c_str(), L"Bottom") == 0) {
         insertPos = itemCount < 0 ? 0 : itemCount;
-        insertAtEnd = true;
+        while (insertPos > 0) {
+            MENUITEMINFOW itemInfo = {};
+            itemInfo.cbSize = sizeof(itemInfo);
+            itemInfo.fMask = MIIM_FTYPE;
+            if (!GetMenuItemInfoW(menu, insertPos - 1, TRUE, &itemInfo) ||
+                !(itemInfo.fType & MFT_SEPARATOR)) {
+                break;
+            }
+            insertPos--;
+        }
+        separatorAbove = true;
+    } else if (_wcsicmp(settings.position.c_str(), L"Default") == 0) {
+        insertPos = 0;
+        for (int i = 0; i < itemCount; i++) {
+            WCHAR text[128] = {};
+            if (GetMenuStringW(menu, i, text, ARRAYSIZE(text), MF_BYPOSITION) > 0 &&
+                (StrStrIW(text, L"Open") || StrStrIW(text, L"Terminal"))) {
+                insertPos = i + 1;
+                break;
+            }
+        }
     } else {
         insertPos = 0;
     }
 
-    InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_STRING, kMenuCommandId,
-                settings.menuText.c_str());
-
-    if (insertAtEnd) {
+    if (separatorAbove) {
         InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+        InsertMenuW(menu, insertPos + 1, MF_BYPOSITION | MF_STRING, kMenuCommandId,
+                    settings.menuText.c_str());
     } else {
+        InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_STRING, kMenuCommandId,
+                    settings.menuText.c_str());
         InsertMenuW(menu, insertPos + 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
     }
 }
@@ -510,8 +556,8 @@ static void LaunchAdminTerminal(const MenuTarget& target) {
     BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
                              0, nullptr, nullptr, &startupInfo, &processInfo);
     if (ok) {
-        Wh_Log(L"Launch succeeded: target=%ls command=%ls",
-               target.path.c_str(), command.c_str());
+        DEBUG_LOG(settings, L"Launch succeeded: target=%ls command=%ls",
+                  target.path.c_str(), command.c_str());
         CloseHandle(processInfo.hThread);
         CloseHandle(processInfo.hProcess);
     } else {
@@ -532,9 +578,18 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
     if (menu && hwnd && IsShellViewWindow(hwnd)) {
         MenuTarget target;
         Settings settings = GetSettingsSnapshot();
-        if (ResolveMenuTarget(hwnd, target) &&
-            IsTargetEnabled(settings, target.kind)) {
+        if (!ResolveMenuTarget(hwnd, target)) {
+            DEBUG_LOG(settings, L"Injection skipped: no eligible filesystem directory target");
+        } else if (!IsTargetEnabled(settings, target.kind)) {
+            DEBUG_LOG(settings,
+                      L"Injection skipped: target kind disabled kind=%ls path=%ls",
+                      TargetKindName(target.kind), target.path.c_str());
+        } else {
+            DEBUG_LOG(settings, L"Injection target: kind=%ls path=%ls",
+                      TargetKindName(target.kind), target.path.c_str());
             InsertAdminTerminalMenuItem(menu, settings);
+            DEBUG_LOG(settings, L"Injection inserted: position=%ls text=%ls",
+                      settings.position.c_str(), settings.menuText.c_str());
             injected = true;
             g_currentMenuHwnd = hwnd;
             g_currentMenuEligible = true;
@@ -570,16 +625,17 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.8-classic");
+    Wh_Log(L"Init v1.9-classic");
 
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = LoadSettings();
-    Wh_Log(L"Settings: background=%d folder=%d drive=%d terminal=%ls position=%ls",
-           static_cast<int>(g_settings.showOnFolderBackground),
-           static_cast<int>(g_settings.showOnFolderItem),
-           static_cast<int>(g_settings.showOnDriveItem),
-           g_settings.terminalChoice.c_str(),
-           g_settings.position.c_str());
+    DEBUG_LOG(g_settings,
+              L"Settings: background=%d folder=%d drive=%d terminal=%ls position=%ls",
+              static_cast<int>(g_settings.showOnFolderBackground),
+              static_cast<int>(g_settings.showOnFolderItem),
+              static_cast<int>(g_settings.showOnDriveItem),
+              g_settings.terminalChoice.c_str(),
+              g_settings.position.c_str());
     ReleaseSRWLockExclusive(&g_settingsLock);
 
     if (!Wh_SetFunctionHook(reinterpret_cast<void*>(TrackPopupMenuEx),
@@ -600,7 +656,8 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
-    Wh_Log(L"Uninit");
+    Settings settings = GetSettingsSnapshot();
+    DEBUG_LOG(settings, L"Uninit");
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* reload) {
