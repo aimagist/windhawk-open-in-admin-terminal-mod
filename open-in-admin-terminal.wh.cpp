@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.10
+// @version         1.11
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -59,10 +59,11 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 ## Version log
 
+- 1.11: Fixed Windows Terminal menu icon lookup when wt.exe is an app execution alias.
 - 1.10: Reduced Explorer menu-open work by limiting selection path reads and caching terminal icon lookup successes and failures.
 - 1.9: Added quiet-by-default debug logging, improved menu placement, tightened filesystem target eligibility, and refreshed docs for classic-menu runtime injection.
 - 1.8: Switched to direct Explorer classic-menu injection with no persistent registry writes.
-
+*/
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
@@ -112,6 +113,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 #include <shlwapi.h>
 #include <exdisp.h>
 #include <shellapi.h>
+#include <winioctl.h>
 
 #include <string>
 #include <utility>
@@ -146,6 +148,14 @@ static Settings g_settings;
 static SRWLOCK g_settingsLock = SRWLOCK_INIT;
 
 static const UINT kMenuCommandId = 0xBF31;
+
+#ifndef IO_REPARSE_TAG_APPEXECLINK
+#define IO_REPARSE_TAG_APPEXECLINK (0x8000001BL)
+#endif
+
+#ifndef MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE (16 * 1024)
+#endif
 
 static thread_local HWND g_currentMenuHwnd = nullptr;
 static thread_local bool g_currentMenuEligible = false;
@@ -275,6 +285,11 @@ static PCWSTR TargetKindName(TargetKind kind) {
 static bool IsDirectoryPath(const std::wstring& path) {
     DWORD attrs = GetFileAttributesW(path.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool IsFilePath(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 static bool IsDriveRootPath(const std::wstring& path) {
@@ -576,6 +591,76 @@ static std::wstring TrimQuotes(const std::wstring& v) {
     return v;
 }
 
+struct ReparseDataHeader {
+    ULONG reparseTag;
+    USHORT reparseDataLength;
+    USHORT reserved;
+};
+
+static bool ResolveAppExecutionAliasTarget(const std::wstring& aliasPath,
+                                           std::wstring& targetOut) {
+    targetOut.clear();
+
+    HANDLE file = CreateFileW(aliasPath.c_str(), FILE_READ_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    std::vector<BYTE> buffer(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    DWORD bytesReturned = 0;
+    BOOL ok = DeviceIoControl(file, FSCTL_GET_REPARSE_POINT, nullptr, 0,
+                              buffer.data(), static_cast<DWORD>(buffer.size()),
+                              &bytesReturned, nullptr);
+    CloseHandle(file);
+
+    if (!ok || bytesReturned < sizeof(ReparseDataHeader)) {
+        return false;
+    }
+
+    const auto* header =
+        reinterpret_cast<const ReparseDataHeader*>(buffer.data());
+    if (header->reparseTag != IO_REPARSE_TAG_APPEXECLINK ||
+        header->reparseDataLength <= sizeof(DWORD) ||
+        bytesReturned < sizeof(ReparseDataHeader) + header->reparseDataLength) {
+        return false;
+    }
+
+    const BYTE* payload = buffer.data() + sizeof(ReparseDataHeader);
+    const wchar_t* field = reinterpret_cast<const wchar_t*>(payload + sizeof(DWORD));
+    size_t remainingChars =
+        (header->reparseDataLength - sizeof(DWORD)) / sizeof(wchar_t);
+    int fieldIndex = 0;
+
+    while (remainingChars > 0) {
+        const wchar_t* start = field;
+        size_t length = 0;
+        while (length < remainingChars && start[length] != L'\0') {
+            length++;
+        }
+
+        if (length > 0 && fieldIndex >= 2) {
+            std::wstring candidate(start, length);
+            if (IsFilePath(candidate)) {
+                targetOut = std::move(candidate);
+                return true;
+            }
+        }
+
+        if (length == remainingChars) {
+            break;
+        }
+
+        field += length + 1;
+        remainingChars -= length + 1;
+        fieldIndex++;
+    }
+
+    return false;
+}
+
 static bool ResolveExecutablePathForIcon(const Settings& settings, std::wstring& exeOut) {
     exeOut.clear();
 
@@ -592,8 +677,7 @@ static bool ResolveExecutablePathForIcon(const Settings& settings, std::wstring&
         if (candidate.empty()) {
             return false;
         }
-        DWORD attrs = GetFileAttributesW(candidate.c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (IsFilePath(candidate)) {
             exeOut = candidate;
             return true;
         }
@@ -609,6 +693,12 @@ static bool ResolveExecutablePathForIcon(const Settings& settings, std::wstring&
         return false;
     }
     exeOut = resolved;
+    if (settings.terminalChoice == L"wt") {
+        std::wstring aliasTarget;
+        if (ResolveAppExecutionAliasTarget(exeOut, aliasTarget)) {
+            exeOut = std::move(aliasTarget);
+        }
+    }
     return true;
 }
 
@@ -870,7 +960,7 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.10-classic");
+    Wh_Log(L"Init v1.11-classic");
 
     g_shellIdListClipboardFormat = RegisterClipboardFormatW(L"Shell IDList Array");
 
