@@ -45,5 +45,6 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 ## Version log
 
+- 1.10: Reduced Explorer menu-open work by limiting selection path reads and caching terminal icon lookup successes and failures.
 - 1.9: Added quiet-by-default debug logging, improved menu placement, tightened filesystem target eligibility, and refreshed docs for classic-menu runtime injection.
 - 1.8: Switched to direct Explorer classic-menu injection with no persistent registry writes.

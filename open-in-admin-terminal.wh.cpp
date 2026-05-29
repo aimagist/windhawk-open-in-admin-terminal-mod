@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.9
+// @version         1.10
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -116,7 +116,15 @@ static const UINT kMenuCommandId = 0xBF31;
 static thread_local HWND g_currentMenuHwnd = nullptr;
 static thread_local bool g_currentMenuEligible = false;
 static thread_local MenuTarget g_currentTarget;
-static thread_local HBITMAP g_currentMenuBitmap = nullptr;
+
+struct MenuBitmapCacheEntry {
+    std::wstring key;
+    HBITMAP bitmap;
+};
+
+static CLIPFORMAT g_shellIdListClipboardFormat = 0;
+static SRWLOCK g_menuBitmapLock = SRWLOCK_INIT;
+static std::vector<MenuBitmapCacheEntry> g_menuBitmapCache;
 
 using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
 static TrackPopupMenuEx_t TrackPopupMenuEx_Orig;
@@ -368,28 +376,34 @@ static bool GetCurrentFolderPath(IFolderView* folderView, std::wstring& folderOu
     return ok;
 }
 
-static void GetSelectedPaths(IShellView* shellView,
-                             std::vector<std::wstring>& selectionOut) {
+static UINT GetSelectedPaths(IShellView* shellView,
+                             std::vector<std::wstring>& selectionOut,
+                             size_t maxPaths) {
     selectionOut.clear();
+    if (maxPaths == 0 || !g_shellIdListClipboardFormat) {
+        return 0;
+    }
 
     IDataObject* dataObject = nullptr;
     if (FAILED(shellView->GetItemObject(SVGIO_SELECTION, IID_IDataObject,
                                         reinterpret_cast<void**>(&dataObject))) ||
         !dataObject) {
-        return;
+        return 0;
     }
 
     FORMATETC format = {
-        static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Shell IDList Array")),
+        g_shellIdListClipboardFormat,
         nullptr,
         DVASPECT_CONTENT,
         -1,
         TYMED_HGLOBAL,
     };
     STGMEDIUM medium = {};
+    UINT selectedCount = 0;
     if (SUCCEEDED(dataObject->GetData(&format, &medium))) {
         CIDA* cida = static_cast<CIDA*>(GlobalLock(medium.hGlobal));
         if (cida) {
+            selectedCount = cida->cidl;
             LPCITEMIDLIST parent =
                 reinterpret_cast<LPCITEMIDLIST>(
                     reinterpret_cast<BYTE*>(cida) + cida->aoffset[0]);
@@ -400,7 +414,11 @@ static void GetSelectedPaths(IShellView* shellView,
                                          IID_IShellFolder,
                                          reinterpret_cast<void**>(&folder))) &&
                 folder) {
-                for (UINT i = 0; i < cida->cidl; i++) {
+                UINT pathsToRead = cida->cidl;
+                if (static_cast<size_t>(pathsToRead) > maxPaths) {
+                    pathsToRead = static_cast<UINT>(maxPaths);
+                }
+                for (UINT i = 0; i < pathsToRead; i++) {
                     LPCITEMIDLIST child =
                         reinterpret_cast<LPCITEMIDLIST>(
                             reinterpret_cast<BYTE*>(cida) + cida->aoffset[i + 1]);
@@ -425,6 +443,7 @@ static void GetSelectedPaths(IShellView* shellView,
     }
 
     dataObject->Release();
+    return selectedCount;
 }
 
 static bool ResolveMenuTarget(HWND hwnd, MenuTarget& targetOut) {
@@ -445,23 +464,43 @@ static bool ResolveMenuTarget(HWND hwnd, MenuTarget& targetOut) {
     if (SUCCEEDED(shellView->QueryInterface(IID_IFolderView,
                                             reinterpret_cast<void**>(&folderView))) &&
         folderView) {
-        std::wstring folderPath;
-        std::vector<std::wstring> selectedPaths;
-        GetCurrentFolderPath(folderView, folderPath);
-        GetSelectedPaths(shellView, selectedPaths);
+        int selectedCount = 0;
+        bool hasSelectedCount =
+            SUCCEEDED(folderView->ItemCount(SVGIO_SELECTION, &selectedCount));
 
-        if (selectedPaths.empty()) {
+        if (hasSelectedCount && selectedCount > 1) {
+            ok = false;
+        } else if (hasSelectedCount && selectedCount == 0) {
+            std::wstring folderPath;
+            GetCurrentFolderPath(folderView, folderPath);
             if (!folderPath.empty() && IsDirectoryPath(folderPath)) {
                 targetOut.kind = TargetKind::FolderBackground;
                 targetOut.path = folderPath;
                 ok = true;
             }
-        } else if (selectedPaths.size() == 1 &&
-                   IsDirectoryPath(selectedPaths[0])) {
-            targetOut.path = selectedPaths[0];
-            targetOut.kind = IsDriveRootPath(targetOut.path) ? TargetKind::DriveItem
-                                                             : TargetKind::FolderItem;
-            ok = true;
+        } else {
+            std::vector<std::wstring> selectedPaths;
+            UINT shellSelectedCount = GetSelectedPaths(shellView, selectedPaths, 2);
+
+            if (selectedPaths.empty()) {
+                if (!hasSelectedCount && shellSelectedCount == 0) {
+                    std::wstring folderPath;
+                    GetCurrentFolderPath(folderView, folderPath);
+                    if (!folderPath.empty() && IsDirectoryPath(folderPath)) {
+                        targetOut.kind = TargetKind::FolderBackground;
+                        targetOut.path = folderPath;
+                        ok = true;
+                    }
+                }
+            } else if ((hasSelectedCount ? selectedCount == 1
+                                         : shellSelectedCount == 1) &&
+                       selectedPaths.size() == 1 &&
+                       IsDirectoryPath(selectedPaths[0])) {
+                targetOut.path = selectedPaths[0];
+                targetOut.kind = IsDriveRootPath(targetOut.path) ? TargetKind::DriveItem
+                                                                 : TargetKind::FolderItem;
+                ok = true;
+            }
         }
 
         folderView->Release();
@@ -604,11 +643,54 @@ static HBITMAP TryCreateMenuBitmapForTerminal(const Settings& settings) {
     return bitmap;
 }
 
-static void ClearCurrentMenuState() {
-    if (g_currentMenuBitmap) {
-        DeleteObject(g_currentMenuBitmap);
-        g_currentMenuBitmap = nullptr;
+static std::wstring GetMenuBitmapCacheKey(const Settings& settings) {
+    return settings.terminalChoice + L"\n" + settings.terminalDisplayCommand;
+}
+
+static HBITMAP GetCachedMenuBitmapForTerminal(const Settings& settings) {
+    std::wstring key = GetMenuBitmapCacheKey(settings);
+
+    AcquireSRWLockShared(&g_menuBitmapLock);
+    for (const auto& entry : g_menuBitmapCache) {
+        if (entry.key == key) {
+            HBITMAP bitmap = entry.bitmap;
+            ReleaseSRWLockShared(&g_menuBitmapLock);
+            return bitmap;
+        }
     }
+    ReleaseSRWLockShared(&g_menuBitmapLock);
+
+    HBITMAP bitmap = TryCreateMenuBitmapForTerminal(settings);
+
+    AcquireSRWLockExclusive(&g_menuBitmapLock);
+    for (const auto& entry : g_menuBitmapCache) {
+        if (entry.key == key) {
+            if (bitmap) {
+                DeleteObject(bitmap);
+            }
+            bitmap = entry.bitmap;
+            ReleaseSRWLockExclusive(&g_menuBitmapLock);
+            return bitmap;
+        }
+    }
+    g_menuBitmapCache.push_back({std::move(key), bitmap});
+    ReleaseSRWLockExclusive(&g_menuBitmapLock);
+
+    return bitmap;
+}
+
+static void ClearMenuBitmapCache() {
+    AcquireSRWLockExclusive(&g_menuBitmapLock);
+    for (const auto& entry : g_menuBitmapCache) {
+        if (entry.bitmap) {
+            DeleteObject(entry.bitmap);
+        }
+    }
+    g_menuBitmapCache.clear();
+    ReleaseSRWLockExclusive(&g_menuBitmapLock);
+}
+
+static void ClearCurrentMenuState() {
     g_currentMenuEligible = false;
     g_currentTarget = {};
     g_currentMenuHwnd = nullptr;
@@ -656,15 +738,13 @@ static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings) {
         InsertMenuW(menu, insertPos + 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
     }
 
-    g_currentMenuBitmap = TryCreateMenuBitmapForTerminal(settings);
-    if (g_currentMenuBitmap) {
+    HBITMAP menuBitmap = GetCachedMenuBitmapForTerminal(settings);
+    if (menuBitmap) {
         MENUITEMINFOW itemInfo = {};
         itemInfo.cbSize = sizeof(itemInfo);
         itemInfo.fMask = MIIM_BITMAP;
-        itemInfo.hbmpItem = g_currentMenuBitmap;
+        itemInfo.hbmpItem = menuBitmap;
         if (!SetMenuItemInfoW(menu, kMenuCommandId, FALSE, &itemInfo)) {
-            DeleteObject(g_currentMenuBitmap);
-            g_currentMenuBitmap = nullptr;
             DEBUG_LOG(settings, L"Menu icon assignment failed");
         } else {
             DEBUG_LOG(settings, L"Menu icon assigned");
@@ -756,7 +836,9 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.9-classic");
+    Wh_Log(L"Init v1.10-classic");
+
+    g_shellIdListClipboardFormat = RegisterClipboardFormatW(L"Shell IDList Array");
 
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = LoadSettings();
@@ -789,6 +871,7 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     Settings settings = GetSettingsSnapshot();
     DEBUG_LOG(settings, L"Uninit");
+    ClearMenuBitmapCache();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* reload) {
@@ -798,6 +881,7 @@ BOOL Wh_ModSettingsChanged(BOOL* reload) {
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = std::move(newSettings);
     ReleaseSRWLockExclusive(&g_settingsLock);
+    ClearMenuBitmapCache();
 
     return TRUE;
 }
