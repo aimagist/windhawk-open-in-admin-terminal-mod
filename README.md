@@ -46,6 +46,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 ## Version log
 
+- 1.13: Fixed elevated wt.exe launches for folder paths containing spaces.
 - 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.
 - 1.11: Fixed Windows Terminal menu icon lookup when wt.exe is an app execution alias.
 - 1.10: Reduced Explorer menu-open work by limiting selection path reads and caching terminal icon lookup successes and failures.

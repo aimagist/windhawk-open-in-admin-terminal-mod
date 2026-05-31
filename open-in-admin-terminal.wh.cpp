@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.12
+// @version         1.13
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -60,6 +60,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 ## Version log
 
+- 1.13: Fixed elevated terminal launches for folder paths containing spaces.
 - 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.
 - 1.11: Fixed Windows Terminal menu icon lookup when wt.exe is an app execution alias.
 - 1.10: Reduced Explorer menu-open work by limiting selection path reads and caching terminal icon lookup successes and failures.
@@ -557,13 +558,54 @@ static std::wstring BuildPSStringLiteral(const std::wstring& value) {
     return L"'" + EscapePS(value) + L"'";
 }
 
+static std::wstring QuoteProcessArgument(const std::wstring& arg) {
+    if (arg.empty()) {
+        return L"\"\"";
+    }
+
+    if (arg.find_first_of(L" \t\r\n\"") == std::wstring::npos) {
+        return arg;
+    }
+
+    std::wstring result;
+    result.reserve(arg.size() + 2);
+    result += L'"';
+
+    size_t backslashes = 0;
+    for (wchar_t c : arg) {
+        if (c == L'\\') {
+            backslashes++;
+            continue;
+        }
+
+        if (c == L'"') {
+            result.append(backslashes * 2 + 1, L'\\');
+            result += c;
+            backslashes = 0;
+            continue;
+        }
+
+        if (backslashes > 0) {
+            result.append(backslashes, L'\\');
+            backslashes = 0;
+        }
+        result += c;
+    }
+
+    if (backslashes > 0) {
+        result.append(backslashes * 2, L'\\');
+    }
+    result += L'"';
+    return result;
+}
+
 static std::wstring BuildPSArgumentArray(const std::vector<std::wstring>& args) {
     std::wstring result = L"@(";
     for (size_t i = 0; i < args.size(); i++) {
         if (i > 0) {
             result += L",";
         }
-        result += BuildPSStringLiteral(args[i]);
+        result += BuildPSStringLiteral(QuoteProcessArgument(args[i]));
     }
     result += L")";
     return result;
@@ -1258,7 +1300,7 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.12-classic");
+    Wh_Log(L"Init v1.13-classic");
 
     g_shellIdListClipboardFormat = RegisterClipboardFormatW(L"Shell IDList Array");
 
