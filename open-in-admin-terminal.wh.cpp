@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.13
+// @version         1.14
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -59,7 +59,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
 
 ## Version log
-
+- 1.14: Added support for Desktop context menu targets.
 - 1.13: Fixed elevated terminal launches for folder paths containing spaces.
 - 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.
 - 1.11: Fixed Windows Terminal menu icon lookup when wt.exe is an app execution alias.
@@ -758,6 +758,98 @@ static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
     return result;
 }
 
+static bool IsDesktopShellViewWindow(HWND hwnd) {
+    bool sawShellView = false;
+    HWND w = hwnd;
+    while (w) {
+        WCHAR className[64] = {};
+        GetClassNameW(w, className, ARRAYSIZE(className));
+        if (_wcsicmp(className, L"SHELLDLL_DefView") == 0) {
+            sawShellView = true;
+        } else if (sawShellView &&
+                   (_wcsicmp(className, L"Progman") == 0 ||
+                    _wcsicmp(className, L"WorkerW") == 0)) {
+            return true;
+        }
+
+        HWND parent = GetParent(w);
+        if (!parent) {
+            parent = GetWindow(w, GW_OWNER);
+        }
+        w = parent;
+    }
+    return false;
+}
+
+static IShellView* GetDesktopShellView() {
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+                                  IID_IShellWindows,
+                                  reinterpret_cast<void**>(&shellWindows));
+    if (FAILED(hr) || !shellWindows) {
+        return nullptr;
+    }
+
+    VARIANT location = {};
+    location.vt = VT_I4;
+    location.lVal = CSIDL_DESKTOP;
+    VARIANT empty = {};
+    long hwnd = 0;
+    IDispatch* dispatch = nullptr;
+    IShellView* result = nullptr;
+    if (SUCCEEDED(shellWindows->FindWindowSW(
+            &location, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH,
+            &dispatch)) &&
+        dispatch) {
+        IServiceProvider* serviceProvider = nullptr;
+        if (SUCCEEDED(dispatch->QueryInterface(
+                IID_IServiceProvider,
+                reinterpret_cast<void**>(&serviceProvider))) &&
+            serviceProvider) {
+            IShellBrowser* shellBrowser = nullptr;
+            if (SUCCEEDED(serviceProvider->QueryService(
+                    SID_STopLevelBrowser,
+                    IID_IShellBrowser,
+                    reinterpret_cast<void**>(&shellBrowser))) &&
+                shellBrowser) {
+                shellBrowser->QueryActiveShellView(&result);
+                shellBrowser->Release();
+            }
+            serviceProvider->Release();
+        }
+        dispatch->Release();
+    }
+
+    shellWindows->Release();
+    return result;
+}
+
+static bool IsDesktopFolderPidl(LPCITEMIDLIST pidl) {
+    LPITEMIDLIST desktopPidl = nullptr;
+    bool result = false;
+    if (SUCCEEDED(SHGetSpecialFolderLocation(nullptr, CSIDL_DESKTOP,
+                                             &desktopPidl)) &&
+        desktopPidl) {
+        result = ILIsEqual(pidl, desktopPidl) != FALSE;
+        CoTaskMemFree(desktopPidl);
+    }
+    return result;
+}
+
+static bool GetDesktopFolderPath(std::wstring& folderOut) {
+    folderOut.clear();
+
+    PWSTR path = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &path)) ||
+        !path) {
+        return false;
+    }
+
+    folderOut = path;
+    CoTaskMemFree(path);
+    return !folderOut.empty();
+}
+
 static bool GetCurrentFolderPath(IFolderView* folderView, std::wstring& folderOut) {
     folderOut.clear();
 
@@ -775,6 +867,8 @@ static bool GetCurrentFolderPath(IFolderView* folderView, std::wstring& folderOu
         if (SHGetPathFromIDListW(folderPidl, path)) {
             folderOut = path;
             ok = true;
+        } else if (IsDesktopFolderPidl(folderPidl)) {
+            ok = GetDesktopFolderPath(folderOut);
         }
         CoTaskMemFree(folderPidl);
     }
@@ -861,7 +955,11 @@ static bool ResolveMenuTarget(HWND hwnd, MenuTarget& targetOut) {
         root = hwnd;
     }
 
+    bool isDesktopShellView = IsDesktopShellViewWindow(hwnd);
     IShellView* shellView = GetActiveShellViewForHwnd(root);
+    if (!shellView && isDesktopShellView) {
+        shellView = GetDesktopShellView();
+    }
     if (!shellView) {
         return false;
     }
@@ -911,6 +1009,15 @@ static bool ResolveMenuTarget(HWND hwnd, MenuTarget& targetOut) {
         }
 
         folderView->Release();
+    }
+
+    if (!ok && isDesktopShellView) {
+        std::wstring folderPath;
+        if (GetDesktopFolderPath(folderPath) && IsDirectoryPath(folderPath)) {
+            targetOut.kind = TargetKind::FolderBackground;
+            targetOut.path = folderPath;
+            ok = true;
+        }
     }
 
     shellView->Release();
