@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.11
+// @version         1.12
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -21,7 +21,7 @@
 - Right-click a folder background and open an admin terminal in that location
 - Right-click a folder item and open an admin terminal inside it
 - Right-click a drive and open an admin terminal at its root
-- Choose your preferred terminal: Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, or a custom command
+- Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
 - Optionally append the terminal name to a custom label (e.g. "Open elevated (Windows Terminal)")
 
@@ -55,10 +55,12 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - On Windows 11, Explorer may place this entry under `Show more options` depending on your context menu setup.
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
 - The mod intentionally targets filesystem folders and drive roots only.
+- Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
 - Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
 
 ## Version log
 
+- 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.
 - 1.11: Fixed Windows Terminal menu icon lookup when wt.exe is an app execution alias.
 - 1.10: Reduced Explorer menu-open work by limiting selection path reads and caching terminal icon lookup successes and failures.
 - 1.9: Added quiet-by-default debug logging, improved menu placement, tightened filesystem target eligibility, and refreshed docs for classic-menu runtime injection.
@@ -71,14 +73,20 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - menuText: Open in Admin Terminal
   $name: Menu text
   $description: Leave empty to use a terminal-specific default label.
-- terminalChoice: wt
+- terminalChoice: auto
   $name: Terminal type
-  $description: Choose which terminal host to launch elevated.
+  $description: Choose which terminal host to launch elevated. If the selected terminal is unavailable, the mod falls back to Auto mode instead of hiding the entry.
   $options:
+    - auto: Auto
     - wt: Windows Terminal
     - pwsh: PowerShell 7
     - powershell: Windows PowerShell
     - cmd: Command Prompt
+    - wsl: WSL
+    - gitbash: Git Bash
+    - wezterm: WezTerm
+    - alacritty: Alacritty
+    - conemu: ConEmu
     - custom: Custom command
 - customTerminalCommand: wt.exe
   $name: Custom terminal command
@@ -124,7 +132,9 @@ struct Settings {
     bool appendTerminalName;
     std::wstring terminalChoice;
     std::wstring customTerminalCommand;
+    std::wstring terminalEffectiveChoice;
     std::wstring terminalDisplayCommand;
+    bool terminalUsedFallback;
     bool showOnFolderBackground;
     bool showOnFolderItem;
     bool showOnDriveItem;
@@ -206,18 +216,268 @@ static std::wstring TrimString(const std::wstring& v) {
     return v.substr(first, last - first + 1);
 }
 
-static std::wstring GetTerminalDisplayName(const Settings& s) {
-    if (s.terminalChoice == L"wt") {
+static std::wstring TrimQuotes(const std::wstring& v) {
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"') {
+        return v.substr(1, v.size() - 2);
+    }
+    return v;
+}
+
+static bool IsFilePath(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool GetEnvironmentString(PCWSTR name, std::wstring& value) {
+    value.clear();
+
+    DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0) {
+        return false;
+    }
+
+    std::vector<wchar_t> buffer(required);
+    DWORD copied = GetEnvironmentVariableW(name, buffer.data(),
+                                           static_cast<DWORD>(buffer.size()));
+    if (copied == 0 || copied >= buffer.size()) {
+        return false;
+    }
+
+    value.assign(buffer.data(), copied);
+    return true;
+}
+
+static void AddEnvironmentPath(std::vector<std::wstring>& candidates,
+                               PCWSTR envName,
+                               PCWSTR relativePath) {
+    std::wstring base;
+    if (!GetEnvironmentString(envName, base) || base.empty()) {
+        return;
+    }
+
+    if (base.back() != L'\\' && base.back() != L'/') {
+        base += L"\\";
+    }
+    candidates.push_back(base + relativePath);
+}
+
+static bool SearchExecutablePath(PCWSTR exe, std::wstring& exeOut) {
+    exeOut.clear();
+
+    WCHAR resolved[MAX_PATH] = {};
+    DWORD len = SearchPathW(nullptr, exe, nullptr, ARRAYSIZE(resolved), resolved,
+                            nullptr);
+    if (len > 0 && len < ARRAYSIZE(resolved)) {
+        exeOut = resolved;
+        return true;
+    }
+
+    if (len >= ARRAYSIZE(resolved)) {
+        std::vector<wchar_t> buffer(len + 1);
+        len = SearchPathW(nullptr, exe, nullptr,
+                          static_cast<DWORD>(buffer.size()), buffer.data(),
+                          nullptr);
+        if (len > 0 && len < buffer.size()) {
+            exeOut = buffer.data();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ResolveExecutableCommand(PCWSTR exe,
+                                     const std::vector<std::wstring>& candidates,
+                                     std::wstring& commandOut) {
+    if (SearchExecutablePath(exe, commandOut)) {
+        return true;
+    }
+
+    for (const auto& candidate : candidates) {
+        if (IsFilePath(candidate)) {
+            commandOut = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ResolveTerminalChoiceExecutable(const std::wstring& choice,
+                                            std::wstring& commandOut) {
+    if (choice == L"wt") {
+        std::vector<std::wstring> candidates;
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Microsoft\\WindowsApps\\wt.exe");
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Microsoft\\WindowsApps\\"
+                           L"Microsoft.WindowsTerminal_8wekyb3d8bbwe\\wt.exe");
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Microsoft\\WindowsApps\\"
+                           L"Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\\wt.exe");
+        return ResolveExecutableCommand(L"wt.exe", candidates, commandOut);
+    }
+    if (choice == L"pwsh") {
+        std::vector<std::wstring> candidates;
+        AddEnvironmentPath(candidates, L"ProgramFiles", L"PowerShell\\7\\pwsh.exe");
+        AddEnvironmentPath(candidates, L"ProgramFiles(x86)",
+                           L"PowerShell\\7\\pwsh.exe");
+        return ResolveExecutableCommand(L"pwsh.exe", candidates, commandOut);
+    }
+    if (choice == L"powershell") {
+        return ResolveExecutableCommand(L"powershell.exe", {}, commandOut);
+    }
+    if (choice == L"cmd") {
+        return ResolveExecutableCommand(L"cmd.exe", {}, commandOut);
+    }
+    if (choice == L"wsl") {
+        return ResolveExecutableCommand(L"wsl.exe", {}, commandOut);
+    }
+    if (choice == L"gitbash") {
+        std::vector<std::wstring> candidates;
+        AddEnvironmentPath(candidates, L"ProgramFiles", L"Git\\git-bash.exe");
+        AddEnvironmentPath(candidates, L"ProgramFiles(x86)", L"Git\\git-bash.exe");
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Programs\\Git\\git-bash.exe");
+        return ResolveExecutableCommand(L"git-bash.exe", candidates, commandOut);
+    }
+    if (choice == L"wezterm") {
+        std::vector<std::wstring> candidates;
+        AddEnvironmentPath(candidates, L"ProgramFiles", L"WezTerm\\wezterm.exe");
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Programs\\WezTerm\\wezterm.exe");
+        return ResolveExecutableCommand(L"wezterm.exe", candidates, commandOut);
+    }
+    if (choice == L"alacritty") {
+        std::vector<std::wstring> candidates;
+        AddEnvironmentPath(candidates, L"ProgramFiles",
+                           L"Alacritty\\alacritty.exe");
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Programs\\Alacritty\\alacritty.exe");
+        return ResolveExecutableCommand(L"alacritty.exe", candidates, commandOut);
+    }
+    if (choice == L"conemu") {
+        std::vector<std::wstring> candidates64;
+        AddEnvironmentPath(candidates64, L"ProgramFiles",
+                           L"ConEmu\\ConEmu64.exe");
+        AddEnvironmentPath(candidates64, L"ProgramFiles(x86)",
+                           L"ConEmu\\ConEmu64.exe");
+        AddEnvironmentPath(candidates64, L"LocalAppData",
+                           L"Programs\\ConEmu\\ConEmu64.exe");
+        if (ResolveExecutableCommand(L"ConEmu64.exe", candidates64, commandOut)) {
+            return true;
+        }
+
+        std::vector<std::wstring> candidates;
+        AddEnvironmentPath(candidates, L"ProgramFiles", L"ConEmu\\ConEmu.exe");
+        AddEnvironmentPath(candidates, L"ProgramFiles(x86)",
+                           L"ConEmu\\ConEmu.exe");
+        AddEnvironmentPath(candidates, L"LocalAppData",
+                           L"Programs\\ConEmu\\ConEmu.exe");
+        return ResolveExecutableCommand(L"ConEmu.exe", candidates, commandOut);
+    }
+
+    return false;
+}
+
+static bool ResolveAutoTerminal(std::wstring& choiceOut,
+                                std::wstring& commandOut) {
+    static constexpr PCWSTR kAutoChoices[] = {
+        L"wt",
+        L"pwsh",
+        L"powershell",
+        L"cmd",
+    };
+
+    for (PCWSTR choice : kAutoChoices) {
+        if (ResolveTerminalChoiceExecutable(choice, commandOut)) {
+            choiceOut = choice;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void ResolveSettingsTerminal(Settings& s) {
+    s.terminalChoice = TrimString(s.terminalChoice);
+    if (s.terminalChoice.empty()) {
+        s.terminalChoice = L"auto";
+    }
+
+    s.terminalEffectiveChoice.clear();
+    s.terminalDisplayCommand.clear();
+    s.terminalUsedFallback = false;
+
+    if (s.terminalChoice == L"custom") {
+        s.terminalDisplayCommand = TrimQuotes(TrimString(s.customTerminalCommand));
+        if (!s.terminalDisplayCommand.empty()) {
+            s.terminalEffectiveChoice = L"custom";
+            return;
+        }
+
+        s.terminalUsedFallback = true;
+    } else if (s.terminalChoice == L"auto") {
+        if (ResolveAutoTerminal(s.terminalEffectiveChoice,
+                                s.terminalDisplayCommand)) {
+            return;
+        }
+    } else if (ResolveTerminalChoiceExecutable(s.terminalChoice,
+                                               s.terminalDisplayCommand)) {
+        s.terminalEffectiveChoice = s.terminalChoice;
+        return;
+    } else {
+        s.terminalUsedFallback = true;
+    }
+
+    if (ResolveAutoTerminal(s.terminalEffectiveChoice, s.terminalDisplayCommand)) {
+        return;
+    }
+
+    s.terminalEffectiveChoice = L"cmd";
+    s.terminalDisplayCommand = L"cmd.exe";
+}
+
+static std::wstring GetTerminalDisplayNameForChoice(const std::wstring& choice) {
+    if (choice == L"wt") {
         return L"Windows Terminal";
     }
-    if (s.terminalChoice == L"pwsh") {
+    if (choice == L"pwsh") {
         return L"PowerShell 7";
     }
-    if (s.terminalChoice == L"powershell") {
+    if (choice == L"powershell") {
         return L"Windows PowerShell";
     }
-    if (s.terminalChoice == L"cmd") {
+    if (choice == L"cmd") {
         return L"Command Prompt";
+    }
+    if (choice == L"wsl") {
+        return L"WSL";
+    }
+    if (choice == L"gitbash") {
+        return L"Git Bash";
+    }
+    if (choice == L"wezterm") {
+        return L"WezTerm";
+    }
+    if (choice == L"alacritty") {
+        return L"Alacritty";
+    }
+    if (choice == L"conemu") {
+        return L"ConEmu";
+    }
+    if (choice == L"custom") {
+        return L"Custom Terminal";
+    }
+    return L"Terminal";
+}
+
+static std::wstring GetTerminalDisplayName(const Settings& s) {
+    if (!s.terminalEffectiveChoice.empty()) {
+        return GetTerminalDisplayNameForChoice(s.terminalEffectiveChoice);
+    }
+    if (s.terminalChoice == L"auto") {
+        return L"Terminal";
     }
     return L"Custom Terminal";
 }
@@ -226,7 +486,7 @@ static Settings LoadSettings() {
     Settings s;
     s.menuText = TrimString(GetSettingString(L"menuText", L""));
     s.appendTerminalName = GetSettingBool(L"appendTerminalName");
-    s.terminalChoice = GetSettingString(L"terminalChoice", L"wt");
+    s.terminalChoice = GetSettingString(L"terminalChoice", L"auto");
     s.customTerminalCommand = GetSettingString(L"customTerminalCommand", L"wt.exe");
     s.showOnFolderBackground = GetSettingBool(L"showOnFolderBackground");
     s.showOnFolderItem = GetSettingBool(L"showOnFolderItem");
@@ -234,18 +494,7 @@ static Settings LoadSettings() {
     s.position = GetSettingString(L"position", L"Top");
     s.debugLogging = GetSettingBool(L"debugLogging");
 
-    if (s.terminalChoice == L"wt") {
-        s.terminalDisplayCommand = L"wt.exe";
-    } else if (s.terminalChoice == L"pwsh") {
-        s.terminalDisplayCommand = L"pwsh.exe";
-    } else if (s.terminalChoice == L"powershell") {
-        s.terminalDisplayCommand = L"powershell.exe";
-    } else if (s.terminalChoice == L"cmd") {
-        s.terminalDisplayCommand = L"cmd.exe";
-    } else {
-        s.terminalDisplayCommand =
-            s.customTerminalCommand.empty() ? L"wt.exe" : s.customTerminalCommand;
-    }
+    ResolveSettingsTerminal(s);
 
     if (s.menuText.empty()) {
         s.menuText = L"Open " + GetTerminalDisplayName(s) + L" as Administrator";
@@ -287,11 +536,6 @@ static bool IsDirectoryPath(const std::wstring& path) {
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-static bool IsFilePath(const std::wstring& path) {
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
 static bool IsDriveRootPath(const std::wstring& path) {
     return PathIsRootW(path.c_str()) != FALSE;
 }
@@ -309,39 +553,111 @@ static std::wstring EscapePS(const std::wstring& s) {
     return out;
 }
 
-static std::wstring BuildStartProcess(const std::wstring& exe,
-                                      const std::wstring& argLiteral) {
-    std::wstring command =
-        L"powershell.exe -NoProfile -WindowStyle Hidden -Command "
-        L"\"Start-Process -FilePath '" + EscapePS(exe) + L"' -Verb RunAs";
-    if (!argLiteral.empty()) {
-        command += L" -ArgumentList " + argLiteral;
+static std::wstring BuildPSStringLiteral(const std::wstring& value) {
+    return L"'" + EscapePS(value) + L"'";
+}
+
+static std::wstring BuildPSArgumentArray(const std::vector<std::wstring>& args) {
+    std::wstring result = L"@(";
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i > 0) {
+            result += L",";
+        }
+        result += BuildPSStringLiteral(args[i]);
     }
-    command += L"\"";
-    return command;
+    result += L")";
+    return result;
+}
+
+static std::wstring Base64Encode(const BYTE* bytes, size_t size) {
+    static constexpr wchar_t kBase64[] =
+        L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::wstring result;
+    result.reserve(((size + 2) / 3) * 4);
+
+    for (size_t i = 0; i < size; i += 3) {
+        BYTE b0 = bytes[i];
+        BYTE b1 = i + 1 < size ? bytes[i + 1] : 0;
+        BYTE b2 = i + 2 < size ? bytes[i + 2] : 0;
+
+        result += kBase64[b0 >> 2];
+        result += kBase64[((b0 & 0x03) << 4) | (b1 >> 4)];
+        result += i + 1 < size ? kBase64[((b1 & 0x0F) << 2) | (b2 >> 6)]
+                               : L'=';
+        result += i + 2 < size ? kBase64[b2 & 0x3F] : L'=';
+    }
+
+    return result;
+}
+
+static std::wstring EncodePowerShellCommand(const std::wstring& script) {
+    return Base64Encode(reinterpret_cast<const BYTE*>(script.data()),
+                        script.size() * sizeof(wchar_t));
+}
+
+static std::wstring BuildSetLocationCommand(const std::wstring& target) {
+    return L"Set-Location -LiteralPath '" + EscapePS(target) + L"'";
+}
+
+static std::wstring BuildStartProcess(const std::wstring& exe,
+                                      const std::vector<std::wstring>& args,
+                                      const std::wstring& workingDirectory) {
+    std::wstring script =
+        L"Start-Process -FilePath " + BuildPSStringLiteral(exe) + L" -Verb RunAs";
+    if (!workingDirectory.empty()) {
+        script += L" -WorkingDirectory " + BuildPSStringLiteral(workingDirectory);
+    }
+    if (!args.empty()) {
+        script += L" -ArgumentList " + BuildPSArgumentArray(args);
+    }
+
+    return L"powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand " +
+           EncodePowerShellCommand(script);
 }
 
 static std::wstring BuildCommand(const Settings& s, const std::wstring& target) {
-    if (s.terminalChoice == L"wt") {
-        return BuildStartProcess(L"wt.exe", L"'-d','" + EscapePS(target) + L"'");
+    const std::wstring& choice = s.terminalEffectiveChoice.empty()
+                                     ? s.terminalChoice
+                                     : s.terminalEffectiveChoice;
+    const std::wstring exe =
+        s.terminalDisplayCommand.empty() ? L"cmd.exe" : s.terminalDisplayCommand;
+
+    if (choice == L"wt") {
+        return BuildStartProcess(exe, {L"-d", target}, {});
     }
-    if (s.terminalChoice == L"pwsh") {
-        return BuildStartProcess(
-            L"pwsh.exe",
-            L"'-NoExit','-Command','Set-Location -LiteralPath ''" +
-                EscapePS(target) + L"'''");
+    if (choice == L"pwsh") {
+        return BuildStartProcess(exe,
+                                 {L"-NoExit", L"-Command",
+                                  BuildSetLocationCommand(target)},
+                                 {});
     }
-    if (s.terminalChoice == L"powershell") {
-        return BuildStartProcess(
-            L"powershell.exe",
-            L"'-NoExit','-Command','Set-Location -LiteralPath ''" +
-                EscapePS(target) + L"'''");
+    if (choice == L"powershell") {
+        return BuildStartProcess(exe,
+                                 {L"-NoExit", L"-Command",
+                                  BuildSetLocationCommand(target)},
+                                 {});
     }
-    if (s.terminalChoice == L"cmd") {
-        return BuildStartProcess(L"cmd.exe", L"'/k','cd /d \"" + target + L"\"'");
+    if (choice == L"cmd") {
+        return BuildStartProcess(exe, {L"/k", L"cd /d \"" + target + L"\""}, {});
+    }
+    if (choice == L"wsl") {
+        return BuildStartProcess(exe, {L"--cd", target}, {});
+    }
+    if (choice == L"gitbash") {
+        return BuildStartProcess(exe, {}, target);
+    }
+    if (choice == L"wezterm") {
+        return BuildStartProcess(exe, {L"start", L"--cwd", target}, {});
+    }
+    if (choice == L"alacritty") {
+        return BuildStartProcess(exe, {L"--working-directory", target}, {});
+    }
+    if (choice == L"conemu") {
+        return BuildStartProcess(exe, {L"-Dir", target}, {});
     }
 
-    return BuildStartProcess(s.terminalDisplayCommand, {});
+    return BuildStartProcess(exe, {}, {});
 }
 
 static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
@@ -584,13 +900,6 @@ static Settings GetSettingsSnapshot() {
     return snapshot;
 }
 
-static std::wstring TrimQuotes(const std::wstring& v) {
-    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"') {
-        return v.substr(1, v.size() - 2);
-    }
-    return v;
-}
-
 struct ReparseDataHeader {
     ULONG reparseTag;
     USHORT reparseDataLength;
@@ -664,36 +973,18 @@ static bool ResolveAppExecutionAliasTarget(const std::wstring& aliasPath,
 static bool ResolveExecutablePathForIcon(const Settings& settings, std::wstring& exeOut) {
     exeOut.clear();
 
-    if (settings.terminalChoice == L"wt") {
-        exeOut = L"wt.exe";
-    } else if (settings.terminalChoice == L"pwsh") {
-        exeOut = L"pwsh.exe";
-    } else if (settings.terminalChoice == L"powershell") {
-        exeOut = L"powershell.exe";
-    } else if (settings.terminalChoice == L"cmd") {
-        exeOut = L"cmd.exe";
-    } else if (settings.terminalChoice == L"custom") {
-        std::wstring candidate = TrimQuotes(TrimString(settings.customTerminalCommand));
-        if (candidate.empty()) {
-            return false;
-        }
-        if (IsFilePath(candidate)) {
-            exeOut = candidate;
-            return true;
-        }
-        return false;
-    } else {
+    std::wstring candidate = TrimQuotes(TrimString(settings.terminalDisplayCommand));
+    if (candidate.empty()) {
         return false;
     }
 
-    WCHAR resolved[MAX_PATH] = {};
-    DWORD len = SearchPathW(nullptr, exeOut.c_str(), nullptr, ARRAYSIZE(resolved), resolved,
-                            nullptr);
-    if (len == 0 || len >= ARRAYSIZE(resolved)) {
+    if (IsFilePath(candidate)) {
+        exeOut = candidate;
+    } else if (!SearchExecutablePath(candidate.c_str(), exeOut)) {
         return false;
     }
-    exeOut = resolved;
-    if (settings.terminalChoice == L"wt") {
+
+    if (settings.terminalEffectiveChoice == L"wt") {
         std::wstring aliasTarget;
         if (ResolveAppExecutionAliasTarget(exeOut, aliasTarget)) {
             exeOut = std::move(aliasTarget);
@@ -768,7 +1059,7 @@ static HBITMAP TryCreateMenuBitmapForTerminal(const Settings& settings) {
 }
 
 static std::wstring GetMenuBitmapCacheKey(const Settings& settings) {
-    return settings.terminalChoice + L"\n" + settings.terminalDisplayCommand;
+    return settings.terminalEffectiveChoice + L"\n" + settings.terminalDisplayCommand;
 }
 
 static HBITMAP GetCachedMenuBitmapForTerminal(const Settings& settings) {
@@ -920,6 +1211,13 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
                       L"Injection skipped: target kind disabled kind=%ls path=%ls",
                       TargetKindName(target.kind), target.path.c_str());
         } else {
+            if (settings.terminalUsedFallback) {
+                DEBUG_LOG(settings,
+                          L"Terminal fallback: requested=%ls effective=%ls command=%ls",
+                          settings.terminalChoice.c_str(),
+                          settings.terminalEffectiveChoice.c_str(),
+                          settings.terminalDisplayCommand.c_str());
+            }
             DEBUG_LOG(settings, L"Injection target: kind=%ls path=%ls",
                       TargetKindName(target.kind), target.path.c_str());
             InsertAdminTerminalMenuItem(menu, settings);
@@ -960,18 +1258,21 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.11-classic");
+    Wh_Log(L"Init v1.12-classic");
 
     g_shellIdListClipboardFormat = RegisterClipboardFormatW(L"Shell IDList Array");
 
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = LoadSettings();
     DEBUG_LOG(g_settings,
-              L"Settings: background=%d folder=%d drive=%d terminal=%ls position=%ls",
+              L"Settings: background=%d folder=%d drive=%d terminal=%ls effective=%ls command=%ls fallback=%d position=%ls",
               static_cast<int>(g_settings.showOnFolderBackground),
               static_cast<int>(g_settings.showOnFolderItem),
               static_cast<int>(g_settings.showOnDriveItem),
               g_settings.terminalChoice.c_str(),
+              g_settings.terminalEffectiveChoice.c_str(),
+              g_settings.terminalDisplayCommand.c_str(),
+              static_cast<int>(g_settings.terminalUsedFallback),
               g_settings.position.c_str());
     ReleaseSRWLockExclusive(&g_settingsLock);
 
