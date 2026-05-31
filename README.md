@@ -7,6 +7,7 @@
 - Right-click a folder background and open an admin terminal in that location
 - Right-click a folder item and open an admin terminal inside it
 - Right-click a drive and open an admin terminal at its root
+- Optionally show the entry when right-clicking filesystem folders and drives in the navigation pane and Quick access
 - Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
 - Optionally append the terminal name to a custom label (e.g. "Open elevated (Windows Terminal)")
@@ -40,11 +41,12 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 - On Windows 11, Explorer may place this entry under `Show more options` depending on your context menu setup.
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
-- The mod intentionally targets filesystem folders and drive roots only.
+- The mod intentionally targets filesystem folders and drive roots only, including optional navigation pane and Quick access support.
 - Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
 - Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
 
 ## Version log
+- 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.
 - 1.13: Fixed elevated wt.exe launches for folder paths containing spaces.
 - 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.

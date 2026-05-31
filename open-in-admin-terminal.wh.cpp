@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.14
+// @version         1.15
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -21,6 +21,7 @@
 - Right-click a folder background and open an admin terminal in that location
 - Right-click a folder item and open an admin terminal inside it
 - Right-click a drive and open an admin terminal at its root
+- Optionally show the entry when right-clicking filesystem folders and drives in the navigation pane and Quick access
 - Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
 - Optionally append the terminal name to a custom label (e.g. "Open elevated (Windows Terminal)")
@@ -54,11 +55,12 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 - On Windows 11, Explorer may place this entry under `Show more options` depending on your context menu setup.
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
-- The mod intentionally targets filesystem folders and drive roots only.
+- The mod intentionally targets filesystem folders and drive roots only, including optional navigation pane and Quick access support.
 - Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
 - Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
 
 ## Version log
+- 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.
 - 1.13: Fixed elevated terminal launches for folder paths containing spaces.
 - 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.
@@ -101,6 +103,9 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - showOnDriveItem: true
   $name: Show on drives
   $description: Add the entry when right-clicking a drive.
+- showOnNavigationPane: false
+  $name: Show in navigation pane
+  $description: Add the entry when right-clicking filesystem folders and drives in Explorer's navigation pane and Quick access.
 - position: Top
   $name: Menu position
   $description: Preferred position in the classic context menu.
@@ -119,6 +124,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 
 #include <windows.h>
 #include <shlobj.h>
+#include <ShObjIdl.h>
 #include <shlwapi.h>
 #include <exdisp.h>
 #include <shellapi.h>
@@ -139,6 +145,7 @@ struct Settings {
     bool showOnFolderBackground;
     bool showOnFolderItem;
     bool showOnDriveItem;
+    bool showOnNavigationPane;
     std::wstring position;
     bool debugLogging;
 };
@@ -492,6 +499,7 @@ static Settings LoadSettings() {
     s.showOnFolderBackground = GetSettingBool(L"showOnFolderBackground");
     s.showOnFolderItem = GetSettingBool(L"showOnFolderItem");
     s.showOnDriveItem = GetSettingBool(L"showOnDriveItem");
+    s.showOnNavigationPane = GetSettingBool(L"showOnNavigationPane");
     s.position = GetSettingString(L"position", L"Top");
     s.debugLogging = GetSettingBool(L"debugLogging");
 
@@ -702,7 +710,7 @@ static std::wstring BuildCommand(const Settings& s, const std::wstring& target) 
     return BuildStartProcess(exe, {}, {});
 }
 
-static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
+static IServiceProvider* GetExplorerServiceProviderForHwnd(HWND topLevel) {
     IShellWindows* shellWindows = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL,
                                   IID_IShellWindows,
@@ -714,7 +722,7 @@ static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
     long count = 0;
     shellWindows->get_Count(&count);
 
-    IShellView* result = nullptr;
+    IServiceProvider* result = nullptr;
     for (long i = 0; i < count && !result; i++) {
         VARIANT index = {};
         index.vt = VT_I4;
@@ -732,22 +740,8 @@ static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
             HWND browserHwnd = nullptr;
             browser->get_HWND(reinterpret_cast<SHANDLE_PTR*>(&browserHwnd));
             if (browserHwnd == topLevel) {
-                IServiceProvider* serviceProvider = nullptr;
-                if (SUCCEEDED(browser->QueryInterface(
-                        IID_IServiceProvider,
-                        reinterpret_cast<void**>(&serviceProvider))) &&
-                    serviceProvider) {
-                    IShellBrowser* shellBrowser = nullptr;
-                    if (SUCCEEDED(serviceProvider->QueryService(
-                            SID_STopLevelBrowser,
-                            IID_IShellBrowser,
-                            reinterpret_cast<void**>(&shellBrowser))) &&
-                        shellBrowser) {
-                        shellBrowser->QueryActiveShellView(&result);
-                        shellBrowser->Release();
-                    }
-                    serviceProvider->Release();
-                }
+                browser->QueryInterface(IID_IServiceProvider,
+                                        reinterpret_cast<void**>(&result));
             }
             browser->Release();
         }
@@ -755,6 +749,31 @@ static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
     }
 
     shellWindows->Release();
+    return result;
+}
+
+static IShellBrowser* GetShellBrowserForHwnd(HWND topLevel) {
+    IServiceProvider* serviceProvider = GetExplorerServiceProviderForHwnd(topLevel);
+    if (!serviceProvider) {
+        return nullptr;
+    }
+
+    IShellBrowser* result = nullptr;
+    serviceProvider->QueryService(SID_STopLevelBrowser, IID_IShellBrowser,
+                                  reinterpret_cast<void**>(&result));
+    serviceProvider->Release();
+    return result;
+}
+
+static IShellView* GetActiveShellViewForHwnd(HWND topLevel) {
+    IShellBrowser* shellBrowser = GetShellBrowserForHwnd(topLevel);
+    if (!shellBrowser) {
+        return nullptr;
+    }
+
+    IShellView* result = nullptr;
+    shellBrowser->QueryActiveShellView(&result);
+    shellBrowser->Release();
     return result;
 }
 
@@ -947,8 +966,114 @@ static UINT GetSelectedPaths(IShellView* shellView,
     return selectedCount;
 }
 
-static bool ResolveMenuTarget(HWND hwnd, MenuTarget& targetOut) {
+static bool GetSingleFilesystemPathFromShellItemArray(IShellItemArray* items,
+                                                       std::wstring& pathOut) {
+    pathOut.clear();
+    if (!items) {
+        return false;
+    }
+
+    DWORD count = 0;
+    if (FAILED(items->GetCount(&count)) || count != 1) {
+        return false;
+    }
+
+    IShellItem* item = nullptr;
+    if (FAILED(items->GetItemAt(0, &item)) || !item) {
+        return false;
+    }
+
+    PWSTR path = nullptr;
+    bool ok = SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path &&
+              path[0];
+    if (ok) {
+        pathOut = path;
+    }
+    if (path) {
+        CoTaskMemFree(path);
+    }
+
+    item->Release();
+    return ok;
+}
+
+static bool IsNavigationPaneWindow(HWND hwnd) {
+    bool sawNavigationTreeClass = false;
+    HWND w = hwnd;
+    while (w) {
+        WCHAR className[64] = {};
+        GetClassNameW(w, className, ARRAYSIZE(className));
+
+        if (_wcsicmp(className, L"NamespaceTreeControl") == 0 ||
+            _wcsicmp(className, L"SysTreeView32") == 0) {
+            sawNavigationTreeClass = true;
+        } else if (_wcsicmp(className, L"CabinetWClass") == 0 ||
+                   _wcsicmp(className, L"ExploreWClass") == 0) {
+            return sawNavigationTreeClass;
+        }
+
+        HWND parent = GetParent(w);
+        if (!parent) {
+            parent = GetWindow(w, GW_OWNER);
+        }
+        w = parent;
+    }
+
+    return false;
+}
+
+static bool ResolveNavigationPaneMenuTarget(HWND hwnd, MenuTarget& targetOut) {
     targetOut = {};
+
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    if (!root) {
+        root = hwnd;
+    }
+
+    IServiceProvider* serviceProvider = GetExplorerServiceProviderForHwnd(root);
+    if (!serviceProvider) {
+        return false;
+    }
+
+    bool ok = false;
+    INameSpaceTreeControl* navigationPane = nullptr;
+    if (SUCCEEDED(serviceProvider->QueryService(
+            SID_SNavigationPane, IID_INameSpaceTreeControl,
+            reinterpret_cast<void**>(&navigationPane))) &&
+        navigationPane) {
+        IShellItemArray* selectedItems = nullptr;
+        if (SUCCEEDED(navigationPane->GetSelectedItems(&selectedItems)) &&
+            selectedItems) {
+            std::wstring path;
+            if (GetSingleFilesystemPathFromShellItemArray(selectedItems, path) &&
+                IsDirectoryPath(path)) {
+                targetOut.path = std::move(path);
+                targetOut.kind = IsDriveRootPath(targetOut.path)
+                                     ? TargetKind::DriveItem
+                                     : TargetKind::FolderItem;
+                ok = true;
+            }
+            selectedItems->Release();
+        }
+        navigationPane->Release();
+    }
+
+    serviceProvider->Release();
+    return ok;
+}
+
+static bool ResolveMenuTarget(HWND hwnd,
+                              bool allowNavigationPane,
+                              MenuTarget& targetOut) {
+    targetOut = {};
+
+    bool isNavigationPane = IsNavigationPaneWindow(hwnd);
+    if (isNavigationPane) {
+        if (!allowNavigationPane) {
+            return false;
+        }
+        return ResolveNavigationPaneMenuTarget(hwnd, targetOut);
+    }
 
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root) {
@@ -1350,10 +1475,11 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
     bool injected = false;
     ClearCurrentMenuState();
 
-    if (menu && hwnd && IsShellViewWindow(hwnd)) {
+    if (menu && hwnd &&
+        (IsShellViewWindow(hwnd) || IsNavigationPaneWindow(hwnd))) {
         MenuTarget target;
         Settings settings = GetSettingsSnapshot();
-        if (!ResolveMenuTarget(hwnd, target)) {
+        if (!ResolveMenuTarget(hwnd, settings.showOnNavigationPane, target)) {
             DEBUG_LOG(settings, L"Injection skipped: no eligible filesystem directory target");
         } else if (!IsTargetEnabled(settings, target.kind)) {
             DEBUG_LOG(settings,
@@ -1407,17 +1533,18 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.13-classic");
+    Wh_Log(L"Init v1.15-classic");
 
     g_shellIdListClipboardFormat = RegisterClipboardFormatW(L"Shell IDList Array");
 
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = LoadSettings();
     DEBUG_LOG(g_settings,
-              L"Settings: background=%d folder=%d drive=%d terminal=%ls effective=%ls command=%ls fallback=%d position=%ls",
+              L"Settings: background=%d folder=%d drive=%d nav=%d terminal=%ls effective=%ls command=%ls fallback=%d position=%ls",
               static_cast<int>(g_settings.showOnFolderBackground),
               static_cast<int>(g_settings.showOnFolderItem),
               static_cast<int>(g_settings.showOnDriveItem),
+              static_cast<int>(g_settings.showOnNavigationPane),
               g_settings.terminalChoice.c_str(),
               g_settings.terminalEffectiveChoice.c_str(),
               g_settings.terminalDisplayCommand.c_str(),
