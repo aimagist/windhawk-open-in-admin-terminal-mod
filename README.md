@@ -45,7 +45,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
 
 ## Version log
-
+- 1.14: Added support for Desktop context menu targets.
 - 1.13: Fixed elevated wt.exe launches for folder paths containing spaces.
 - 1.12: Added Auto fallback and WSL, Git Bash, WezTerm, Alacritty, and ConEmu terminal presets.
 - 1.11: Fixed Windows Terminal menu icon lookup when wt.exe is an app execution alias.
