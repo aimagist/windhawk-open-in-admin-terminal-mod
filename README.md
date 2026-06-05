@@ -43,9 +43,15 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
 - The mod intentionally targets filesystem folders and drive roots only, including optional navigation pane and Quick access support.
 - Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
-- Routine diagnostics are quiet by default. Enable debug logging in the settings when troubleshooting target detection or launch behavior.
+- Custom commands can use `%V` or `%1` in arguments to insert the selected folder path.
+- Diagnostics use Windhawk's built-in logging controls.
+
+## Source
+
+This standalone repo is the canonical source for `open-in-admin-terminal.wh.cpp`. The Windhawk catalog file at `mods/open-in-admin-terminal.wh.cpp` is a downstream mirror.
 
 ## Version log
+- 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.
 - 1.13: Fixed elevated wt.exe launches for folder paths containing spaces.
