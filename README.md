@@ -33,9 +33,10 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 ## How to use
 
 1. Open Windhawk.
-2. Create a new mod.
-3. Paste in `open-in-admin-terminal.wh.cpp`.
-4. Compile and enable it.
+2. Install `Open in Admin Terminal` from the Windhawk catalog.
+3. If the catalog version isn't available yet, create a new mod.
+4. Paste in `open-in-admin-terminal.wh.cpp`.
+5. Compile and enable it.
 
 ## Notes
 
