@@ -2039,7 +2039,7 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init v1.16-classic");
+    Wh_Log(L"Init");
 
     g_shellIdListClipboardFormat = RegisterClipboardFormatW(L"Shell IDList Array");
 
