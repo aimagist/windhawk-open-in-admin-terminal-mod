@@ -191,6 +191,56 @@ static bool TestPowerShellBypassCanBeDisabled() {
                  "disabled execution-policy bypass should add no bypass arguments");
 }
 
+static bool TestCmdPathsAreAlwaysQuoted() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"cmd";
+    settings.terminalDisplayCommand = L"C:\\Windows\\System32\\cmd.exe";
+    settings.keepOpenAfterScript = true;
+
+    LaunchSpec terminalSpec = BuildLaunchSpec(settings, L"C:\\R&D");
+    LaunchSpec batchSpec =
+        BuildScriptLaunchSpec(settings, L"C:\\Scripts\\build&deploy.bat");
+    LaunchSpec scriptHostSpec =
+        BuildScriptLaunchSpec(settings, L"C:\\Scripts\\build&deploy.vbs");
+
+    std::wstring cscriptPath;
+    if (!Check(ResolveSystemExecutablePath(L"cscript.exe", cscriptPath),
+               "cscript.exe should resolve from the system directory")) {
+        return false;
+    }
+
+    return Check(terminalSpec.parameters == L"/k cd /d \"C:\\R&D\"",
+                 "cmd terminal target should always be quoted") &&
+           Check(batchSpec.parameters ==
+                     L"/k \"C:\\Scripts\\build&deploy.bat\"",
+                 "batch script path should always be quoted") &&
+           Check(scriptHostSpec.parameters.find(QuoteCmdPath(cscriptPath)) !=
+                     std::wstring::npos,
+                 "nested cscript path should always be quoted") &&
+           Check(scriptHostSpec.parameters.find(
+                     L"\"C:\\Scripts\\build&deploy.vbs\"") !=
+                     std::wstring::npos,
+                 "nested script path should always be quoted");
+}
+
+static bool TestKeyboardContextMenuSentinel() {
+    return Check(IsKeyboardContextMenuPoint({-1, -1}),
+                 "(-1, -1) should identify keyboard context-menu invocation") &&
+           Check(!IsKeyboardContextMenuPoint({-1, 10}),
+                 "only the complete keyboard sentinel should be accepted") &&
+           Check(!IsKeyboardContextMenuPoint({10, -1}),
+                 "ordinary screen points should not use selection fallback");
+}
+
+static bool TestDelayedMenuCommandKeepsState() {
+    return Check(!ShouldClearMenuStateAfterTracking(0, TRUE),
+                 "successful posted-command menus should retain target state") &&
+           Check(ShouldClearMenuStateAfterTracking(0, FALSE),
+                 "canceled posted-command menus should clear target state") &&
+           Check(ShouldClearMenuStateAfterTracking(TPM_RETURNCMD, TRUE),
+                 "return-command menus should clear target state immediately");
+}
+
 int main() {
     if (!TestInitializationLogIsVersionNeutral()) {
         return 1;
@@ -219,7 +269,16 @@ int main() {
     if (!TestPowerShellBypassCanBeDisabled()) {
         return 1;
     }
+    if (!TestCmdPathsAreAlwaysQuoted()) {
+        return 1;
+    }
+    if (!TestKeyboardContextMenuSentinel()) {
+        return 1;
+    }
+    if (!TestDelayedMenuCommandKeepsState()) {
+        return 1;
+    }
 
-    std::cout << "PASS: 9 tests\n";
+    std::cout << "PASS: 12 tests\n";
     return 0;
 }
