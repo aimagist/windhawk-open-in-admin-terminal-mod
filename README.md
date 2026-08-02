@@ -13,6 +13,7 @@
 - Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
 - Optionally append the terminal name to a custom label (e.g. "Open elevated (Windows Terminal)")
+- Choose whether script entries include the terminal name or use shorter labels
 
 ## Preview
 
@@ -55,7 +56,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 This standalone repo is the canonical source for `open-in-admin-terminal.wh.cpp`. The Windhawk catalog file at `mods/open-in-admin-terminal.wh.cpp` is a downstream mirror.
 
 ## Version log
-- 1.17: Added optional non-elevated terminal entries and configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js). Both features are opt-in and disabled by default.
+- 1.17: Added optional non-elevated terminal entries, configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js), and shorter script labels. The two extra entry features are opt-in and disabled by default; terminal names remain shown in script entries by default for compatibility.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.

@@ -27,6 +27,7 @@
 - Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
 - Optionally append the terminal name to a custom label (e.g. "Open elevated (Windows Terminal)")
+- Choose whether script entries include the terminal name or use shorter labels
 
 ## Preview
 
@@ -52,7 +53,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - Diagnostics use Windhawk's built-in logging controls.
 
 ## Version log
-- 1.17: Added optional non-elevated terminal entries and configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js). Both features are opt-in and disabled by default.
+- 1.17: Added optional non-elevated terminal entries, configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js), and shorter script labels. The two extra entry features are opt-in and disabled by default; terminal names remain shown in script entries by default for compatibility.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.
@@ -126,6 +127,9 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
     - admin: Run as administrator
     - normal: Run normally
     - both: Show both
+- appendScriptTerminalName: true
+  $name: Append terminal name to script entries
+  $description: Add the selected terminal name to script actions. Disable for shorter labels.
 - scriptExtensions: ".ps1;.bat;.cmd;.vbs;.js"
   $name: Script extensions
   $description: Semicolon-separated extensions treated as scripts.
@@ -167,6 +171,7 @@ struct Settings {
     std::wstring nonElevatedMenuText;
     bool showOnScriptFiles;
     std::wstring scriptMenuEntries;
+    bool appendScriptTerminalName;
     std::wstring scriptExtensions;
     bool keepOpenAfterScript;
     bool scriptExecutionPolicyBypass;
@@ -533,6 +538,7 @@ static Settings LoadSettings() {
     s.nonElevatedMenuText = GetSettingString(L"nonElevatedMenuText", L"");
     s.showOnScriptFiles = GetSettingBool(L"showOnScriptFiles");
     s.scriptMenuEntries = GetSettingString(L"scriptMenuEntries", L"admin");
+    s.appendScriptTerminalName = GetSettingBool(L"appendScriptTerminalName");
     s.scriptExtensions = GetSettingString(L"scriptExtensions", L".ps1;.bat;.cmd;.vbs;.js");
     s.keepOpenAfterScript = GetSettingBool(L"keepOpenAfterScript");
     s.scriptExecutionPolicyBypass = GetSettingBool(L"scriptExecutionPolicyBypass");
@@ -1726,13 +1732,22 @@ static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings,
     std::wstring displayName = isScript
                                    ? GetScriptTerminalDisplayName(settings, target.path)
                                    : GetTerminalDisplayName(settings);
-    std::wstring adminLabel = isScript
-                                  ? L"Run script in " + displayName +
-                                        L" as administrator"
-                                  : settings.menuText;
+    std::wstring adminLabel;
+    if (isScript) {
+        adminLabel = L"Run script";
+        if (settings.appendScriptTerminalName) {
+            adminLabel += L" in " + displayName;
+        }
+        adminLabel += L" as administrator";
+    } else {
+        adminLabel = settings.menuText;
+    }
     std::wstring normalLabel;
     if (isScript) {
-        normalLabel = L"Run script in " + displayName;
+        normalLabel = L"Run script";
+        if (settings.appendScriptTerminalName) {
+            normalLabel += L" in " + displayName;
+        }
     } else {
         normalLabel = settings.nonElevatedMenuText;
         if (normalLabel.empty()) {
