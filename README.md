@@ -7,6 +7,8 @@
 - Right-click a folder background and open an admin terminal in that location
 - Right-click a folder item and open an admin terminal inside it
 - Right-click a drive and open an admin terminal at its root
+- Optionally add a second terminal entry that opens without administrator privileges
+- Optionally run `.ps1`, `.bat`, `.cmd`, `.vbs`, and `.js` script files normally, as administrator, or both
 - Optionally show the entry when right-clicking filesystem folders and drives in the navigation pane and Quick access
 - Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
@@ -44,6 +46,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
 - The mod intentionally targets filesystem folders and drive roots only, including optional navigation pane and Quick access support.
 - Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
+- Script actions use the selected terminal when it can host the required Windows interpreter. WSL, Git Bash, and custom commands fall back to PowerShell, Command Prompt, or Windows Script Host and use that actual program name in the menu.
 - Custom commands can use `%V` or `%1` in arguments to insert the selected folder path.
 - Diagnostics use Windhawk's built-in logging controls.
 
@@ -52,6 +55,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 This standalone repo is the canonical source for `open-in-admin-terminal.wh.cpp`. The Windhawk catalog file at `mods/open-in-admin-terminal.wh.cpp` is a downstream mirror.
 
 ## Version log
+- 1.17: Added optional non-elevated terminal entries and configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js). Both features are opt-in and disabled by default.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.

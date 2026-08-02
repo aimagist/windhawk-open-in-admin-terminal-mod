@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.16
+// @version         1.17
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -21,6 +21,8 @@
 - Right-click a folder background and open an admin terminal in that location
 - Right-click a folder item and open an admin terminal inside it
 - Right-click a drive and open an admin terminal at its root
+- Optionally add a second terminal entry that opens without administrator privileges
+- Optionally run `.ps1`, `.bat`, `.cmd`, `.vbs`, and `.js` script files normally, as administrator, or both
 - Optionally show the entry when right-clicking filesystem folders and drives in the navigation pane and Quick access
 - Choose your preferred terminal: Auto, Windows Terminal, PowerShell 7, Windows PowerShell, Command Prompt, WSL, Git Bash, WezTerm, Alacritty, ConEmu, or a custom command
 - Customize the context menu label, or let the mod use a smart default based on your terminal choice
@@ -46,9 +48,11 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
 - The mod intentionally targets filesystem folders and drive roots only, including optional navigation pane and Quick access support.
 - Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
+- Script actions use the selected terminal when it can host the required Windows interpreter. WSL, Git Bash, and custom commands fall back to PowerShell, Command Prompt, or Windows Script Host and use that actual program name in the menu.
 - Diagnostics use Windhawk's built-in logging controls.
 
 ## Version log
+- 1.17: Added optional non-elevated terminal entries and configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js). Both features are opt-in and disabled by default.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
 - 1.14: Added support for Desktop context menu targets.
@@ -106,6 +110,31 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - appendTerminalName: false
   $name: Append terminal name
   $description: When Menu text is set, append the selected terminal name in parentheses.
+- showNonElevatedEntry: false
+  $name: Show non-elevated entry
+  $description: Add a second context menu entry to open a terminal without admin privileges.
+- nonElevatedMenuText: ""
+  $name: Non-elevated menu text
+  $description: Leave empty for auto label based on terminal name.
+- showOnScriptFiles: false
+  $name: Show on script files
+  $description: Add context menu entries when right-clicking supported script files.
+- scriptMenuEntries: admin
+  $name: Script menu entries
+  $description: Choose which actions to show for script files.
+  $options:
+    - admin: Run as administrator
+    - normal: Run normally
+    - both: Show both
+- scriptExtensions: ".ps1;.bat;.cmd;.vbs;.js"
+  $name: Script extensions
+  $description: Semicolon-separated extensions treated as scripts.
+- keepOpenAfterScript: true
+  $name: Keep terminal open after script
+  $description: Terminal stays open after script finishes.
+- scriptExecutionPolicyBypass: true
+  $name: Bypass execution policy for .ps1
+  $description: Adds -ExecutionPolicy Bypass for PowerShell scripts.
 */
 // ==/WindhawkModSettings==
 
@@ -134,6 +163,13 @@ struct Settings {
     bool showOnDriveItem;
     bool showOnNavigationPane;
     std::wstring position;
+    bool showNonElevatedEntry;
+    std::wstring nonElevatedMenuText;
+    bool showOnScriptFiles;
+    std::wstring scriptMenuEntries;
+    std::wstring scriptExtensions;
+    bool keepOpenAfterScript;
+    bool scriptExecutionPolicyBypass;
 };
 
 enum class TargetKind {
@@ -141,6 +177,7 @@ enum class TargetKind {
     FolderBackground,
     FolderItem,
     DriveItem,
+    ScriptItem,
 };
 
 struct MenuTarget {
@@ -154,10 +191,16 @@ struct LaunchSpec {
     std::wstring workingDirectory;
 };
 
+static Settings GetSettingsSnapshot();
+static void LaunchTerminalNonElevated(const MenuTarget&);
+static LaunchSpec BuildScriptLaunchSpec(const Settings&, const std::wstring&);
+static bool IsScriptExtension(const std::wstring&, const Settings&);
+
 static Settings g_settings;
 static SRWLOCK g_settingsLock = SRWLOCK_INIT;
 
 static const UINT kMenuCommandId = 0xBF31;
+static const UINT kMenuCommandIdNonElevated = 0xBF32;
 
 #ifndef IO_REPARSE_TAG_APPEXECLINK
 #define IO_REPARSE_TAG_APPEXECLINK (0x8000001BL)
@@ -486,6 +529,13 @@ static Settings LoadSettings() {
     s.showOnDriveItem = GetSettingBool(L"showOnDriveItem");
     s.showOnNavigationPane = GetSettingBool(L"showOnNavigationPane");
     s.position = GetSettingString(L"position", L"Top");
+    s.showNonElevatedEntry = GetSettingBool(L"showNonElevatedEntry");
+    s.nonElevatedMenuText = GetSettingString(L"nonElevatedMenuText", L"");
+    s.showOnScriptFiles = GetSettingBool(L"showOnScriptFiles");
+    s.scriptMenuEntries = GetSettingString(L"scriptMenuEntries", L"admin");
+    s.scriptExtensions = GetSettingString(L"scriptExtensions", L".ps1;.bat;.cmd;.vbs;.js");
+    s.keepOpenAfterScript = GetSettingBool(L"keepOpenAfterScript");
+    s.scriptExecutionPolicyBypass = GetSettingBool(L"scriptExecutionPolicyBypass");
 
     ResolveSettingsTerminal(s);
 
@@ -508,6 +558,9 @@ static bool IsTargetEnabled(const Settings& s, TargetKind kind) {
     if (kind == TargetKind::DriveItem) {
         return s.showOnDriveItem;
     }
+    if (kind == TargetKind::ScriptItem) {
+        return s.showOnScriptFiles;
+    }
     return false;
 }
 
@@ -521,12 +574,42 @@ static PCWSTR TargetKindName(TargetKind kind) {
     if (kind == TargetKind::DriveItem) {
         return L"drive-item";
     }
+    if (kind == TargetKind::ScriptItem) {
+        return L"script-item";
+    }
     return L"none";
 }
 
 static bool IsDirectoryPath(const std::wstring& path) {
     DWORD attrs = GetFileAttributesW(path.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool IsScriptExtension(const std::wstring& path, const Settings& s) {
+    PCWSTR ext = PathFindExtensionW(path.c_str());
+    if (!ext || !*ext) {
+        return false;
+    }
+
+    if (_wcsicmp(ext, L".ps1") != 0 && _wcsicmp(ext, L".bat") != 0 &&
+        _wcsicmp(ext, L".cmd") != 0 && _wcsicmp(ext, L".vbs") != 0 &&
+        _wcsicmp(ext, L".js") != 0) {
+        return false;
+    }
+
+    size_t start = 0;
+    while (start <= s.scriptExtensions.size()) {
+        size_t end = s.scriptExtensions.find(L';', start);
+        std::wstring token = TrimString(s.scriptExtensions.substr(start, end - start));
+        if (_wcsicmp(token.c_str(), ext) == 0) {
+            return true;
+        }
+        if (end == std::wstring::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return false;
 }
 
 static bool IsDriveRootPath(const std::wstring& path) {
@@ -713,6 +796,93 @@ static LaunchSpec BuildLaunchSpec(const Settings& s, const std::wstring& target)
         return spec;
     }
 
+    return spec;
+}
+
+static LaunchSpec BuildScriptInterpreterSpec(const Settings& s,
+                                             const std::wstring& scriptPath) {
+    LaunchSpec spec;
+    PCWSTR ext = PathFindExtensionW(scriptPath.c_str());
+    size_t separator = scriptPath.find_last_of(L"\\/");
+    spec.workingDirectory = scriptPath.substr(
+        0, separator == 2 && scriptPath.size() > 2 && scriptPath[1] == L':'
+               ? separator + 1
+               : separator);
+
+    if (_wcsicmp(ext, L".ps1") == 0) {
+        if (s.terminalEffectiveChoice == L"pwsh" ||
+            s.terminalEffectiveChoice == L"powershell") {
+            spec.executable = s.terminalDisplayCommand;
+        } else if (!ResolveTerminalChoiceExecutable(L"pwsh", spec.executable)) {
+            spec.executable = L"powershell.exe";
+        }
+        std::vector<std::wstring> args;
+        if (s.keepOpenAfterScript) {
+            args.push_back(L"-NoExit");
+        }
+        if (s.scriptExecutionPolicyBypass) {
+            args.push_back(L"-ExecutionPolicy");
+            args.push_back(L"Bypass");
+        }
+        args.push_back(L"-File");
+        args.push_back(scriptPath);
+        spec.parameters = JoinCommandLineArguments(args);
+    } else if (_wcsicmp(ext, L".bat") == 0 ||
+               _wcsicmp(ext, L".cmd") == 0) {
+        spec.executable = L"cmd.exe";
+        spec.parameters =
+            std::wstring(s.keepOpenAfterScript ? L"/k " : L"/c ") +
+            QuoteCommandLineArgument(scriptPath);
+    } else if (_wcsicmp(ext, L".vbs") == 0 ||
+               _wcsicmp(ext, L".js") == 0) {
+        std::wstring scriptCommand =
+            L"cscript.exe //nologo " + QuoteCommandLineArgument(scriptPath);
+        if (s.keepOpenAfterScript) {
+            spec.executable = L"cmd.exe";
+            spec.parameters = L"/k " + scriptCommand;
+        } else {
+            spec.executable = L"cscript.exe";
+            spec.parameters = L"//nologo " + QuoteCommandLineArgument(scriptPath);
+        }
+    }
+    return spec;
+}
+
+static bool IsScriptHostChoice(const std::wstring& choice) {
+    return choice == L"wt" || choice == L"wezterm" ||
+           choice == L"alacritty" || choice == L"conemu";
+}
+
+static LaunchSpec BuildScriptLaunchSpec(const Settings& s,
+                                        const std::wstring& scriptPath) {
+    LaunchSpec interpreter = BuildScriptInterpreterSpec(s, scriptPath);
+    if (!IsScriptHostChoice(s.terminalEffectiveChoice)) {
+        return interpreter;
+    }
+
+    LaunchSpec spec;
+    spec.executable = s.terminalDisplayCommand;
+    spec.workingDirectory = interpreter.workingDirectory;
+    std::vector<std::wstring> args;
+
+    if (s.terminalEffectiveChoice == L"wt") {
+        args = {L"new-tab", L"-d", interpreter.workingDirectory,
+                interpreter.executable};
+    } else if (s.terminalEffectiveChoice == L"wezterm") {
+        args = {L"start", L"--cwd", interpreter.workingDirectory, L"--",
+                interpreter.executable};
+    } else if (s.terminalEffectiveChoice == L"alacritty") {
+        args = {L"--working-directory", interpreter.workingDirectory, L"-e",
+                interpreter.executable};
+    } else {
+        args = {L"-Dir", interpreter.workingDirectory, L"-run",
+                interpreter.executable};
+    }
+
+    spec.parameters = JoinCommandLineArguments(args);
+    if (!interpreter.parameters.empty()) {
+        spec.parameters += L" " + interpreter.parameters;
+    }
     return spec;
 }
 
@@ -1136,6 +1306,15 @@ static bool ResolveMenuTarget(HWND hwnd,
                 targetOut.kind = IsDriveRootPath(targetOut.path) ? TargetKind::DriveItem
                                                                  : TargetKind::FolderItem;
                 ok = true;
+            } else if (selectedPaths.size() == 1 &&
+                       IsFilePath(selectedPaths[0])) {
+                Settings snap = GetSettingsSnapshot();
+                if (snap.showOnScriptFiles &&
+                    IsScriptExtension(selectedPaths[0], snap)) {
+                    targetOut.path = selectedPaths[0];
+                    targetOut.kind = TargetKind::ScriptItem;
+                    ok = true;
+                }
             }
         }
 
@@ -1408,6 +1587,51 @@ static HBITMAP GetCachedMenuBitmapForTerminal(const Settings& settings) {
     return bitmap;
 }
 
+static HBITMAP GetCachedMenuBitmapNoShield(const Settings& settings) {
+    std::wstring key = GetMenuBitmapCacheKey(settings) + L"\nno-shield";
+
+    AcquireSRWLockShared(&g_menuBitmapLock);
+    for (const auto& entry : g_menuBitmapCache) {
+        if (entry.key == key) {
+            HBITMAP bitmap = entry.bitmap;
+            ReleaseSRWLockShared(&g_menuBitmapLock);
+            return bitmap;
+        }
+    }
+    ReleaseSRWLockShared(&g_menuBitmapLock);
+
+    std::wstring exePath;
+    HBITMAP bitmap = nullptr;
+    if (ResolveExecutablePathForIcon(settings, exePath)) {
+        SHFILEINFOW shfi = {};
+        if (SHGetFileInfoW(exePath.c_str(), FILE_ATTRIBUTE_NORMAL, &shfi,
+                           sizeof(shfi),
+                           SHGFI_ICON | SHGFI_SMALLICON |
+                               SHGFI_USEFILEATTRIBUTES)) {
+            bitmap = CreateMenuBitmapFromIcon(shfi.hIcon, nullptr);
+            if (shfi.hIcon) {
+                DestroyIcon(shfi.hIcon);
+            }
+        }
+    }
+
+    AcquireSRWLockExclusive(&g_menuBitmapLock);
+    for (const auto& entry : g_menuBitmapCache) {
+        if (entry.key == key) {
+            if (bitmap) {
+                DeleteObject(bitmap);
+            }
+            bitmap = entry.bitmap;
+            ReleaseSRWLockExclusive(&g_menuBitmapLock);
+            return bitmap;
+        }
+    }
+    g_menuBitmapCache.push_back({std::move(key), bitmap});
+    ReleaseSRWLockExclusive(&g_menuBitmapLock);
+
+    return bitmap;
+}
+
 static void ClearMenuBitmapCache() {
     AcquireSRWLockExclusive(&g_menuBitmapLock);
     for (const auto& entry : g_menuBitmapCache) {
@@ -1425,7 +1649,40 @@ static void ClearCurrentMenuState() {
     g_currentMenuHwnd = nullptr;
 }
 
-static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings) {
+static std::wstring GetScriptTerminalDisplayName(const Settings& settings,
+                                                 const std::wstring& scriptPath) {
+    if (IsScriptHostChoice(settings.terminalEffectiveChoice)) {
+        return GetTerminalDisplayName(settings);
+    }
+
+    LaunchSpec interpreter = BuildScriptInterpreterSpec(settings, scriptPath);
+    if (StrStrIW(interpreter.executable.c_str(), L"pwsh")) {
+        return L"PowerShell 7";
+    }
+    if (StrStrIW(interpreter.executable.c_str(), L"powershell")) {
+        return L"Windows PowerShell";
+    }
+    if (StrStrIW(interpreter.executable.c_str(), L"cmd")) {
+        return L"Command Prompt";
+    }
+    return L"Windows Script Host";
+}
+
+static Settings GetScriptIconSettings(const Settings& settings,
+                                      const std::wstring& scriptPath) {
+    if (IsScriptHostChoice(settings.terminalEffectiveChoice)) {
+        return settings;
+    }
+
+    Settings iconSettings = settings;
+    LaunchSpec interpreter = BuildScriptInterpreterSpec(settings, scriptPath);
+    iconSettings.terminalEffectiveChoice.clear();
+    iconSettings.terminalDisplayCommand = interpreter.executable;
+    return iconSettings;
+}
+
+static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings,
+                                        const MenuTarget& target) {
     int itemCount = GetMenuItemCount(menu);
     int insertPos = 0;
     bool separatorAbove = false;
@@ -1457,40 +1714,133 @@ static void InsertAdminTerminalMenuItem(HMENU menu, const Settings& settings) {
         insertPos = 0;
     }
 
-    if (separatorAbove) {
-        InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
-        InsertMenuW(menu, insertPos + 1, MF_BYPOSITION | MF_STRING, kMenuCommandId,
-                    settings.menuText.c_str());
+    bool isScript = target.kind == TargetKind::ScriptItem;
+    bool showAdmin = !isScript || settings.scriptMenuEntries != L"normal";
+    bool showNormal = isScript
+                          ? settings.scriptMenuEntries == L"normal" ||
+                                settings.scriptMenuEntries == L"both"
+                          : settings.showNonElevatedEntry;
+    Settings iconSettings = isScript
+                                ? GetScriptIconSettings(settings, target.path)
+                                : settings;
+    std::wstring displayName = isScript
+                                   ? GetScriptTerminalDisplayName(settings, target.path)
+                                   : GetTerminalDisplayName(settings);
+    std::wstring adminLabel = isScript
+                                  ? L"Run script in " + displayName +
+                                        L" as administrator"
+                                  : settings.menuText;
+    std::wstring normalLabel;
+    if (isScript) {
+        normalLabel = L"Run script in " + displayName;
     } else {
-        InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_STRING, kMenuCommandId,
-                    settings.menuText.c_str());
-        InsertMenuW(menu, insertPos + 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+        normalLabel = settings.nonElevatedMenuText;
+        if (normalLabel.empty()) {
+            normalLabel = L"Open " + displayName + L" here";
+        }
     }
 
-    HBITMAP menuBitmap = GetCachedMenuBitmapForTerminal(settings);
-    if (menuBitmap) {
-        MENUITEMINFOW itemInfo = {};
-        itemInfo.cbSize = sizeof(itemInfo);
-        itemInfo.fMask = MIIM_BITMAP;
-        itemInfo.hbmpItem = menuBitmap;
-        if (!SetMenuItemInfoW(menu, kMenuCommandId, FALSE, &itemInfo)) {
-            Wh_Log(L"Menu icon assignment failed");
+    int actionPos = insertPos;
+    if (separatorAbove) {
+        InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+        actionPos++;
+    }
+
+    if (showAdmin) {
+        InsertMenuW(menu, actionPos++, MF_BYPOSITION | MF_STRING, kMenuCommandId,
+                    adminLabel.c_str());
+    }
+    if (showNormal) {
+        InsertMenuW(menu, actionPos++, MF_BYPOSITION | MF_STRING,
+                    kMenuCommandIdNonElevated, normalLabel.c_str());
+    }
+    if (!separatorAbove) {
+        InsertMenuW(menu, actionPos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    }
+
+    if (showAdmin) {
+        HBITMAP menuBitmap = GetCachedMenuBitmapForTerminal(iconSettings);
+        if (menuBitmap) {
+            MENUITEMINFOW itemInfo = {};
+            itemInfo.cbSize = sizeof(itemInfo);
+            itemInfo.fMask = MIIM_BITMAP;
+            itemInfo.hbmpItem = menuBitmap;
+            if (!SetMenuItemInfoW(menu, kMenuCommandId, FALSE, &itemInfo)) {
+                Wh_Log(L"Menu icon assignment failed");
+            } else {
+                Wh_Log(L"Menu icon assigned");
+            }
         } else {
-            Wh_Log(L"Menu icon assigned");
+            Wh_Log(L"Menu icon unavailable");
         }
-    } else {
-        Wh_Log(L"Menu icon unavailable");
+    }
+
+    if (showNormal) {
+        HBITMAP menuBitmapNoShield = GetCachedMenuBitmapNoShield(iconSettings);
+        if (menuBitmapNoShield) {
+            MENUITEMINFOW itemInfo = {};
+            itemInfo.cbSize = sizeof(itemInfo);
+            itemInfo.fMask = MIIM_BITMAP;
+            itemInfo.hbmpItem = menuBitmapNoShield;
+            if (!SetMenuItemInfoW(menu, kMenuCommandIdNonElevated, FALSE,
+                                  &itemInfo)) {
+                Wh_Log(L"Non-elevated menu icon assignment failed");
+            } else {
+                Wh_Log(L"Non-elevated menu icon assigned");
+            }
+        } else {
+            Wh_Log(L"Non-elevated menu icon unavailable");
+        }
     }
 }
 
 static void LaunchAdminTerminal(const MenuTarget& target) {
     Settings settings = GetSettingsSnapshot();
-    LaunchSpec launch = BuildLaunchSpec(settings, target.path);
+    LaunchSpec launch = (target.kind == TargetKind::ScriptItem)
+                            ? BuildScriptLaunchSpec(settings, target.path)
+                            : BuildLaunchSpec(settings, target.path);
 
     SHELLEXECUTEINFOW executeInfo = {};
     executeInfo.cbSize = sizeof(executeInfo);
     executeInfo.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
     executeInfo.lpVerb = L"runas";
+    executeInfo.lpFile = launch.executable.c_str();
+    executeInfo.lpParameters =
+        launch.parameters.empty() ? nullptr : launch.parameters.c_str();
+    executeInfo.lpDirectory =
+        launch.workingDirectory.empty() ? nullptr : launch.workingDirectory.c_str();
+    executeInfo.nShow = SW_SHOWNORMAL;
+
+    POINT cursorPos;
+    if (GetCursorPos(&cursorPos)) {
+        executeInfo.fMask |= SEE_MASK_HMONITOR;
+        executeInfo.hMonitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTONEAREST);
+    }
+
+    if (ShellExecuteExW(&executeInfo)) {
+        Wh_Log(L"Launch succeeded: target=%ls executable=%ls parameters=%ls",
+               target.path.c_str(), launch.executable.c_str(),
+               launch.parameters.c_str());
+    } else {
+        DWORD error = GetLastError();
+        if (error != ERROR_CANCELLED) {
+            Wh_Log(L"Launch failed: error=%lu target=%ls executable=%ls parameters=%ls",
+                   error, target.path.c_str(), launch.executable.c_str(),
+                   launch.parameters.c_str());
+        }
+    }
+}
+
+static void LaunchTerminalNonElevated(const MenuTarget& target) {
+    Settings settings = GetSettingsSnapshot();
+    LaunchSpec launch = (target.kind == TargetKind::ScriptItem)
+                            ? BuildScriptLaunchSpec(settings, target.path)
+                            : BuildLaunchSpec(settings, target.path);
+
+    SHELLEXECUTEINFOW executeInfo = {};
+    executeInfo.cbSize = sizeof(executeInfo);
+    executeInfo.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    executeInfo.lpVerb = L"open";
     executeInfo.lpFile = launch.executable.c_str();
     executeInfo.lpParameters =
         launch.parameters.empty() ? nullptr : launch.parameters.c_str();
@@ -1545,9 +1895,9 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
             }
             Wh_Log(L"Injection target: kind=%ls path=%ls",
                    TargetKindName(target.kind), target.path.c_str());
-            InsertAdminTerminalMenuItem(menu, settings);
-            Wh_Log(L"Injection inserted: position=%ls text=%ls",
-                   settings.position.c_str(), settings.menuText.c_str());
+            InsertAdminTerminalMenuItem(menu, settings, target);
+            Wh_Log(L"Injection inserted: position=%ls kind=%ls",
+                   settings.position.c_str(), TargetKindName(target.kind));
             injected = true;
             g_currentMenuHwnd = hwnd;
             g_currentMenuEligible = true;
@@ -1565,6 +1915,14 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
         return 0;
     }
 
+    if (injected && (flags & TPM_RETURNCMD) &&
+        static_cast<UINT>(result) == kMenuCommandIdNonElevated) {
+        MenuTarget target = g_currentTarget;
+        ClearCurrentMenuState();
+        LaunchTerminalNonElevated(target);
+        return 0;
+    }
+
     return result;
 }
 
@@ -1576,6 +1934,16 @@ BOOL WINAPI PostMessageW_Hook(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         MenuTarget target = g_currentTarget;
         ClearCurrentMenuState();
         LaunchAdminTerminal(target);
+        return TRUE;
+    }
+
+    if (message == WM_COMMAND &&
+        LOWORD(wParam) == kMenuCommandIdNonElevated &&
+        g_currentMenuEligible &&
+        hwnd == g_currentMenuHwnd) {
+        MenuTarget target = g_currentTarget;
+        ClearCurrentMenuState();
+        LaunchTerminalNonElevated(target);
         return TRUE;
     }
 
