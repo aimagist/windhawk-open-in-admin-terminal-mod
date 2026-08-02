@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds an Explorer classic context menu entry to open an elevated terminal in the current or selected folder.
-// @version         1.17
+// @version         1.17.1
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -53,6 +53,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - Diagnostics use Windhawk's built-in logging controls.
 
 ## Version log
+- 1.17.1: Fix navigation pane menu not appearing: the entry was missing when right-clicking folders or drives in File Explorer’s left sidebar and Quick access. Now it works :)
 - 1.17: Added optional non-elevated terminal entries, configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js), and shorter script labels. The two extra entry features are opt-in and disabled by default; terminal names remain shown in script entries by default for compatibility.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
@@ -200,6 +201,7 @@ static Settings GetSettingsSnapshot();
 static void LaunchTerminalNonElevated(const MenuTarget&);
 static LaunchSpec BuildScriptLaunchSpec(const Settings&, const std::wstring&);
 static bool IsScriptExtension(const std::wstring&, const Settings&);
+static bool IsShellViewWindow(HWND hwnd);
 
 static Settings g_settings;
 static SRWLOCK g_settingsLock = SRWLOCK_INIT;
@@ -1148,6 +1150,25 @@ static UINT GetSelectedPaths(IShellView* shellView,
     return selectedCount;
 }
 
+static bool GetFilesystemPathFromShellItem(IShellItem* item,
+                                           std::wstring& pathOut) {
+    pathOut.clear();
+    if (!item) {
+        return false;
+    }
+
+    PWSTR path = nullptr;
+    bool ok = SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) &&
+              path && path[0];
+    if (ok) {
+        pathOut = path;
+    }
+    if (path) {
+        CoTaskMemFree(path);
+    }
+    return ok;
+}
+
 static bool GetSingleFilesystemPathFromShellItemArray(IShellItemArray* items,
                                                        std::wstring& pathOut) {
     pathOut.clear();
@@ -1165,16 +1186,7 @@ static bool GetSingleFilesystemPathFromShellItemArray(IShellItemArray* items,
         return false;
     }
 
-    PWSTR path = nullptr;
-    bool ok = SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path &&
-              path[0];
-    if (ok) {
-        pathOut = path;
-    }
-    if (path) {
-        CoTaskMemFree(path);
-    }
-
+    bool ok = GetFilesystemPathFromShellItem(item, pathOut);
     item->Release();
     return ok;
 }
@@ -1204,6 +1216,27 @@ static bool IsNavigationPaneWindow(HWND hwnd) {
     return false;
 }
 
+static bool IsNavigationPaneContextWindow(HWND hwnd) {
+    if (IsNavigationPaneWindow(hwnd)) {
+        return true;
+    }
+
+    HWND focus = GetFocus();
+    if (focus && IsNavigationPaneWindow(focus)) {
+        return true;
+    }
+
+    POINT cursorPos;
+    if (GetCursorPos(&cursorPos)) {
+        HWND underCursor = WindowFromPoint(cursorPos);
+        if (underCursor && IsNavigationPaneWindow(underCursor)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool ResolveNavigationPaneMenuTarget(HWND hwnd, MenuTarget& targetOut) {
     targetOut = {};
 
@@ -1223,19 +1256,51 @@ static bool ResolveNavigationPaneMenuTarget(HWND hwnd, MenuTarget& targetOut) {
             SID_SNavigationPane, IID_INameSpaceTreeControl,
             reinterpret_cast<void**>(&navigationPane))) &&
         navigationPane) {
-        IShellItemArray* selectedItems = nullptr;
-        if (SUCCEEDED(navigationPane->GetSelectedItems(&selectedItems)) &&
-            selectedItems) {
-            std::wstring path;
-            if (GetSingleFilesystemPathFromShellItemArray(selectedItems, path) &&
-                IsDirectoryPath(path)) {
-                targetOut.path = std::move(path);
-                targetOut.kind = IsDriveRootPath(targetOut.path)
-                                     ? TargetKind::DriveItem
-                                     : TargetKind::FolderItem;
-                ok = true;
+        IShellBrowser* shellBrowser = nullptr;
+        HWND treeWindow = nullptr;
+        if (SUCCEEDED(serviceProvider->QueryService(
+                SID_STopLevelBrowser, IID_IShellBrowser,
+                reinterpret_cast<void**>(&shellBrowser))) &&
+            shellBrowser) {
+            shellBrowser->GetControlWindow(FCW_TREE, &treeWindow);
+            shellBrowser->Release();
+        }
+
+        POINT cursorPos;
+        if (treeWindow && GetCursorPos(&cursorPos) &&
+            ScreenToClient(treeWindow, &cursorPos)) {
+            IShellItem* hitItem = nullptr;
+            if (SUCCEEDED(navigationPane->HitTest(&cursorPos, &hitItem)) &&
+                hitItem) {
+                std::wstring path;
+                if (GetFilesystemPathFromShellItem(hitItem, path) &&
+                    IsDirectoryPath(path)) {
+                    targetOut.path = std::move(path);
+                    targetOut.kind = IsDriveRootPath(targetOut.path)
+                                         ? TargetKind::DriveItem
+                                         : TargetKind::FolderItem;
+                    ok = true;
+                }
+                hitItem->Release();
             }
-            selectedItems->Release();
+        }
+
+        if (!ok && IsNavigationPaneContextWindow(hwnd)) {
+            IShellItemArray* selectedItems = nullptr;
+            if (SUCCEEDED(navigationPane->GetSelectedItems(&selectedItems)) &&
+                selectedItems) {
+                std::wstring path;
+                if (GetSingleFilesystemPathFromShellItemArray(selectedItems,
+                                                               path) &&
+                    IsDirectoryPath(path)) {
+                    targetOut.path = std::move(path);
+                    targetOut.kind = IsDriveRootPath(targetOut.path)
+                                         ? TargetKind::DriveItem
+                                         : TargetKind::FolderItem;
+                    ok = true;
+                }
+                selectedItems->Release();
+            }
         }
         navigationPane->Release();
     }
@@ -1249,12 +1314,21 @@ static bool ResolveMenuTarget(HWND hwnd,
                               MenuTarget& targetOut) {
     targetOut = {};
 
-    bool isNavigationPane = IsNavigationPaneWindow(hwnd);
+    bool isNavigationPane = IsNavigationPaneContextWindow(hwnd);
     if (isNavigationPane) {
         if (!allowNavigationPane) {
             return false;
         }
         return ResolveNavigationPaneMenuTarget(hwnd, targetOut);
+    }
+
+    if (allowNavigationPane &&
+        ResolveNavigationPaneMenuTarget(hwnd, targetOut)) {
+        return true;
+    }
+
+    if (!IsShellViewWindow(hwnd)) {
+        return false;
     }
 
     HWND root = GetAncestor(hwnd, GA_ROOT);
@@ -1892,8 +1966,7 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
     bool injected = false;
     ClearCurrentMenuState();
 
-    if (menu && hwnd &&
-        (IsShellViewWindow(hwnd) || IsNavigationPaneWindow(hwnd))) {
+    if (menu && hwnd) {
         MenuTarget target;
         Settings settings = GetSettingsSnapshot();
         if (!ResolveMenuTarget(hwnd, settings.showOnNavigationPane, target)) {

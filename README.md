@@ -56,6 +56,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 This standalone repo is the canonical source for `open-in-admin-terminal.wh.cpp`. The Windhawk catalog file at `mods/open-in-admin-terminal.wh.cpp` is a downstream mirror.
 
 ## Version log
+- 1.17.1: Fix navigation pane menu not appearing: the entry was missing when right-clicking folders or drives in File Explorer’s left sidebar and Quick access. Fixed it!
 - 1.17: Added optional non-elevated terminal entries, configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js), and shorter script labels. The two extra entry features are opt-in and disabled by default; terminal names remain shown in script entries by default for compatibility.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
 - 1.15: Added optional navigation pane and Quick access support for filesystem folders and drives.
