@@ -200,8 +200,13 @@ static bool TestCmdPathsAreAlwaysQuoted() {
     LaunchSpec terminalSpec = BuildLaunchSpec(settings, L"C:\\R&D");
     LaunchSpec batchSpec =
         BuildScriptLaunchSpec(settings, L"C:\\Scripts\\build&deploy.bat");
+    LaunchSpec programFilesBatchSpec = BuildScriptLaunchSpec(
+        settings, L"C:\\Program Files (x86)\\App\\install.bat");
     LaunchSpec scriptHostSpec =
-        BuildScriptLaunchSpec(settings, L"C:\\Scripts\\build&deploy.vbs");
+        BuildScriptLaunchSpec(settings, L"C:\\t\\a.vbs");
+    settings.keepOpenAfterScript = false;
+    LaunchSpec closedBatchSpec =
+        BuildScriptLaunchSpec(settings, L"C:\\Scripts\\build&deploy.bat");
 
     std::wstring cscriptPath;
     if (!Check(ResolveSystemExecutablePath(L"cscript.exe", cscriptPath),
@@ -209,18 +214,39 @@ static bool TestCmdPathsAreAlwaysQuoted() {
         return false;
     }
 
-    return Check(terminalSpec.parameters == L"/k cd /d \"C:\\R&D\"",
-                 "cmd terminal target should always be quoted") &&
+    return Check(terminalSpec.parameters ==
+                     L"/s /k \"cd /d \"C:\\R&D\"\"",
+                 "cmd terminal command should preserve quoted metacharacters") &&
            Check(batchSpec.parameters ==
-                     L"/k \"C:\\Scripts\\build&deploy.bat\"",
-                 "batch script path should always be quoted") &&
-           Check(scriptHostSpec.parameters.find(QuoteCmdPath(cscriptPath)) !=
-                     std::wstring::npos,
-                 "nested cscript path should always be quoted") &&
-           Check(scriptHostSpec.parameters.find(
-                     L"\"C:\\Scripts\\build&deploy.vbs\"") !=
-                     std::wstring::npos,
-                 "nested script path should always be quoted");
+                     L"/s /k \"\"C:\\Scripts\\build&deploy.bat\"\"",
+                 "batch metacharacters should remain inside inner quotes") &&
+           Check(programFilesBatchSpec.parameters ==
+                     L"/s /k \"\"C:\\Program Files (x86)\\App\\install.bat\"\"",
+                 "batch paths with spaces and parentheses should remain quoted") &&
+           Check(closedBatchSpec.parameters ==
+                     L"/s /c \"\"C:\\Scripts\\build&deploy.bat\"\"",
+                 "non-keep-open batch commands should preserve inner quotes") &&
+           Check(scriptHostSpec.parameters ==
+                     L"/s /k \"\"" + cscriptPath +
+                         L"\" //nologo \"C:\\t\\a.vbs\"\"",
+                 "keep-open script host command should preserve both inner paths");
+}
+
+static bool TestScriptHostWithoutKeepOpenBypassesCmd() {
+    Settings settings{};
+    settings.keepOpenAfterScript = false;
+
+    LaunchSpec spec = BuildScriptLaunchSpec(settings, L"C:\\t\\a.vbs");
+    std::wstring cscriptPath;
+    if (!Check(ResolveSystemExecutablePath(L"cscript.exe", cscriptPath),
+               "cscript.exe should resolve from the system directory")) {
+        return false;
+    }
+
+    return Check(spec.executable == cscriptPath,
+                 "script host without keep-open should launch cscript directly") &&
+           Check(spec.parameters == L"//nologo C:\\t\\a.vbs",
+                 "direct cscript arguments should not use cmd wrapping");
 }
 
 static bool TestKeyboardContextMenuSentinel() {
@@ -272,6 +298,9 @@ int main() {
     if (!TestCmdPathsAreAlwaysQuoted()) {
         return 1;
     }
+    if (!TestScriptHostWithoutKeepOpenBypassesCmd()) {
+        return 1;
+    }
     if (!TestKeyboardContextMenuSentinel()) {
         return 1;
     }
@@ -279,6 +308,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: 12 tests\n";
+    std::cout << "PASS: 13 tests\n";
     return 0;
 }
