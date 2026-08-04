@@ -249,6 +249,54 @@ static bool TestScriptHostWithoutKeepOpenBypassesCmd() {
                  "direct cscript arguments should not use cmd wrapping");
 }
 
+static bool TestCmdWrappedScriptsBypassTerminalHosts() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"wt";
+    settings.terminalDisplayCommand = L"wt.exe";
+    settings.keepOpenAfterScript = true;
+
+    LaunchSpec batchSpec =
+        BuildScriptLaunchSpec(settings, L"C:\\My Scripts\\Run Me.cmd");
+    LaunchSpec scriptHostSpec =
+        BuildScriptLaunchSpec(settings, L"C:\\My Scripts\\Run Me.vbs");
+    settings.keepOpenAfterScript = false;
+    LaunchSpec directScriptHostSpec =
+        BuildScriptLaunchSpec(settings, L"C:\\My Scripts\\Run Me.vbs");
+
+    std::wstring cmdPath;
+    std::wstring cscriptPath;
+    if (!Check(ResolveSystemExecutablePath(L"cmd.exe", cmdPath),
+               "cmd.exe should resolve from the system directory") ||
+        !Check(ResolveSystemExecutablePath(L"cscript.exe", cscriptPath),
+               "cscript.exe should resolve from the system directory")) {
+        return false;
+    }
+
+    return Check(batchSpec.executable == cmdPath,
+                 "batch scripts should bypass terminal hosts") &&
+           Check(batchSpec.parameters ==
+                     L"/s /k \"\"C:\\My Scripts\\Run Me.cmd\"\"",
+                 "direct batch launch should preserve cmd quoting") &&
+           Check(scriptHostSpec.executable == cmdPath,
+                 "keep-open script-host actions should bypass terminal hosts") &&
+           Check(directScriptHostSpec.executable == L"wt.exe",
+                 "plain argv-style script-host actions may use terminal hosts") &&
+           Check(directScriptHostSpec.parameters.find(cscriptPath) !=
+                     std::wstring::npos,
+                 "terminal-hosted script actions should retain trusted cscript path");
+}
+
+static bool TestNavigationPaneSelectionFallbackRules() {
+    return Check(ShouldUseFocusedNavigationPaneFallback(false, true, false),
+                 "lost tracking points should fall back to focused navigation") &&
+           Check(!ShouldUseFocusedNavigationPaneFallback(true, true, false),
+                 "navigation-pane points should remain hit-test-only") &&
+           Check(!ShouldUseFocusedNavigationPaneFallback(false, true, true),
+                 "shell-view menus should never use navigation selection") &&
+           Check(!ShouldUseFocusedNavigationPaneFallback(false, false, false),
+                 "fallback should require navigation-pane focus");
+}
+
 static bool TestKeyboardContextMenuSentinel() {
     return Check(IsKeyboardContextMenuPoint({-1, -1}),
                  "(-1, -1) should identify keyboard context-menu invocation") &&
@@ -301,6 +349,12 @@ int main() {
     if (!TestScriptHostWithoutKeepOpenBypassesCmd()) {
         return 1;
     }
+    if (!TestCmdWrappedScriptsBypassTerminalHosts()) {
+        return 1;
+    }
+    if (!TestNavigationPaneSelectionFallbackRules()) {
+        return 1;
+    }
     if (!TestKeyboardContextMenuSentinel()) {
         return 1;
     }
@@ -308,6 +362,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: 13 tests\n";
+    std::cout << "PASS: 15 tests\n";
     return 0;
 }
