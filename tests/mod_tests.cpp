@@ -286,6 +286,34 @@ static bool TestCmdWrappedScriptsBypassTerminalHosts() {
                  "terminal-hosted script actions should retain trusted cscript path");
 }
 
+static bool TestCmdWrappedScriptPresentationUsesInterpreter() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"wt";
+    settings.terminalDisplayCommand = L"wt.exe";
+    settings.keepOpenAfterScript = true;
+
+    std::wstring cmdPath;
+    if (!Check(ResolveSystemExecutablePath(L"cmd.exe", cmdPath),
+               "cmd.exe should resolve from the system directory")) {
+        return false;
+    }
+
+    Settings batchIconSettings =
+        GetScriptIconSettings(settings, L"C:\\Scripts\\Run.cmd");
+    Settings scriptHostIconSettings =
+        GetScriptIconSettings(settings, L"C:\\Scripts\\Run.vbs");
+    return Check(GetScriptTerminalDisplayName(
+                     settings, L"C:\\Scripts\\Run.cmd") == L"Command Prompt",
+                 "batch labels should describe Command Prompt") &&
+           Check(GetScriptTerminalDisplayName(
+                     settings, L"C:\\Scripts\\Run.vbs") == L"Windows Script Host",
+                 "keep-open script-host labels should describe Windows Script Host") &&
+           Check(batchIconSettings.terminalDisplayCommand == cmdPath,
+                 "batch icons should use the direct cmd executable") &&
+           Check(scriptHostIconSettings.terminalDisplayCommand == cmdPath,
+                 "keep-open script-host icons should use the direct cmd executable");
+}
+
 static bool TestNavigationPaneSelectionFallbackRules() {
     return Check(ShouldUseFocusedNavigationPaneFallback(false, true, false),
                  "lost tracking points should fall back to focused navigation") &&
@@ -352,6 +380,9 @@ int main() {
     if (!TestCmdWrappedScriptsBypassTerminalHosts()) {
         return 1;
     }
+    if (!TestCmdWrappedScriptPresentationUsesInterpreter()) {
+        return 1;
+    }
     if (!TestNavigationPaneSelectionFallbackRules()) {
         return 1;
     }
@@ -362,6 +393,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: 15 tests\n";
+    std::cout << "PASS: 16 tests\n";
     return 0;
 }

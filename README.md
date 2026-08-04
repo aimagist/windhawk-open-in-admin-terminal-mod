@@ -47,7 +47,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - The entry is injected only while Explorer's classic menu is open; disabling the mod leaves no registry cleanup behind.
 - The mod intentionally targets filesystem folders and drive roots only, including optional navigation pane and Quick access support.
 - Auto chooses Windows Terminal, PowerShell 7, Windows PowerShell, then Command Prompt. If another built-in preset is unavailable, the mod falls back to Auto instead of hiding the entry.
-- Script actions use the selected terminal when it can host the required Windows interpreter. WSL, Git Bash, and custom commands fall back to PowerShell, Command Prompt, or Windows Script Host and use that actual program name in the menu.
+- Script actions use the selected terminal only when it can safely host the required interpreter. Batch scripts and keep-open Windows Script Host scripts launch through Command Prompt; menu labels show Command Prompt or Windows Script Host. WSL, Git Bash, and custom commands fall back to a compatible Windows interpreter.
 - Custom commands can use `%V` or `%1` in arguments to insert the selected folder path.
 - Diagnostics use Windhawk's built-in logging controls.
 
