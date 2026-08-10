@@ -76,7 +76,7 @@ static bool TestCustomCommandReceivesSelectedFolder() {
 static bool TestRelativeCustomCommandResolvesExecutable() {
     Settings settings{};
     settings.terminalEffectiveChoice = L"custom";
-    settings.customTerminalCommand = L"cmd.exe /d /c echo %V";
+    settings.customTerminalCommand = L"cmd.exe /d /c echo %V %1";
 
     LaunchSpec spec = BuildLaunchSpec(settings, L"C:\\Selected Folder");
 
@@ -84,7 +84,9 @@ static bool TestRelativeCustomCommandResolvesExecutable() {
                  "relative custom executable should resolve") &&
            Check(IsAbsolutePath(spec.executable),
                  "relative custom executable should become an absolute path") &&
-           Check(spec.parameters == L"/d /c echo C:\\Selected Folder",
+           Check(spec.parameters ==
+                     L"/d /c echo \"C:\\Selected Folder\" "
+                     L"\"C:\\Selected Folder\"",
                  "resolved custom command should preserve and expand arguments");
 }
 
@@ -357,14 +359,21 @@ static bool TestCmdWrappedScriptPresentationUsesInterpreter() {
 }
 
 static bool TestNavigationPaneSelectionFallbackRules() {
-    return Check(ShouldUseFocusedNavigationPaneFallback(false, true, false),
+    return Check(ShouldUseFocusedNavigationPaneFallback(false, true, false,
+                                                        false),
                  "lost tracking points should fall back to focused navigation") &&
-           Check(!ShouldUseFocusedNavigationPaneFallback(true, true, false),
+           Check(!ShouldUseFocusedNavigationPaneFallback(true, true, false,
+                                                         false),
                  "navigation-pane points should remain hit-test-only") &&
-           Check(!ShouldUseFocusedNavigationPaneFallback(false, true, true),
+           Check(!ShouldUseFocusedNavigationPaneFallback(false, true, true,
+                                                         false),
                  "shell-view menus should never use navigation selection") &&
-           Check(!ShouldUseFocusedNavigationPaneFallback(false, false, false),
-                 "fallback should require navigation-pane focus");
+           Check(!ShouldUseFocusedNavigationPaneFallback(false, false, false,
+                                                         false),
+                 "fallback should require navigation-pane focus") &&
+           Check(!ShouldUseFocusedNavigationPaneFallback(false, true, false,
+                                                         true),
+                 "Explorer chrome menus should not use navigation selection");
 }
 
 static bool TestKeyboardContextMenuSentinel() {
