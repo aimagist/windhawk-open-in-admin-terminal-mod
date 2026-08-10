@@ -37,6 +37,10 @@ static bool Check(bool condition, const char* message) {
     return true;
 }
 
+static bool IsAbsolutePath(const std::wstring& path) {
+    return !PathIsRelativeW(path.c_str());
+}
+
 static bool TestInitializationLogIsVersionNeutral() {
     g_logFormats.clear();
 
@@ -67,6 +71,48 @@ static bool TestCustomCommandReceivesSelectedFolder() {
                  "custom command should expand %V and %1") &&
            Check(spec.workingDirectory == L"C:\\Folder With Spaces",
                  "custom command should use the selected folder as working directory");
+}
+
+static bool TestRelativeCustomCommandResolvesExecutable() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"custom";
+    settings.customTerminalCommand = L"cmd.exe /d /c echo %V";
+
+    LaunchSpec spec = BuildLaunchSpec(settings, L"C:\\Selected Folder");
+
+    return Check(!spec.executable.empty(),
+                 "relative custom executable should resolve") &&
+           Check(IsAbsolutePath(spec.executable),
+                 "relative custom executable should become an absolute path") &&
+           Check(spec.parameters == L"/d /c echo C:\\Selected Folder",
+                 "resolved custom command should preserve and expand arguments");
+}
+
+static bool TestUnresolvedCustomCommandFailsClosed() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"custom";
+    settings.customTerminalCommand =
+        L"open-in-admin-terminal-missing-test-executable.exe %V";
+
+    LaunchSpec spec = BuildLaunchSpec(settings, L"C:\\Selected Folder");
+
+    return Check(spec.executable.empty(),
+                 "unresolved custom executable should fail closed");
+}
+
+static bool TestEmptyDisplayCommandUsesSystemCmd() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"cmd";
+
+    LaunchSpec spec = BuildLaunchSpec(settings, L"C:\\Selected Folder");
+    std::wstring cmdPath;
+    if (!Check(ResolveSystemExecutablePath(L"cmd.exe", cmdPath),
+               "cmd.exe should resolve from the system directory")) {
+        return false;
+    }
+
+    return Check(spec.executable == cmdPath,
+                 "empty display command should use the trusted system cmd path");
 }
 
 static bool TestWindowsTerminalQuotesSelectedFolder() {
@@ -103,10 +149,6 @@ static bool TestPowerShellScriptHonorsExecutionSettings() {
                  "PowerShell script should honor execution settings and quote its path") &&
            Check(spec.workingDirectory == L"C:\\Scripts",
                  "PowerShell script should use its parent directory");
-}
-
-static bool IsAbsolutePath(const std::wstring& path) {
-    return !PathIsRelativeW(path.c_str());
 }
 
 static bool TestScriptInterpretersUseTrustedAbsolutePaths() {
@@ -361,6 +403,15 @@ int main() {
     if (!TestCustomCommandReceivesSelectedFolder()) {
         return 1;
     }
+    if (!TestRelativeCustomCommandResolvesExecutable()) {
+        return 1;
+    }
+    if (!TestUnresolvedCustomCommandFailsClosed()) {
+        return 1;
+    }
+    if (!TestEmptyDisplayCommandUsesSystemCmd()) {
+        return 1;
+    }
     if (!TestWindowsTerminalQuotesSelectedFolder()) {
         return 1;
     }
@@ -407,6 +458,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: 17 tests\n";
+    std::cout << "PASS: 20 tests\n";
     return 0;
 }
