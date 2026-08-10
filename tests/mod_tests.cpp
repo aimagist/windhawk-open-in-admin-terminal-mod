@@ -343,6 +343,17 @@ static bool TestDelayedMenuCommandKeepsState() {
                  "return-command menus should clear target state immediately");
 }
 
+static bool TestDesktopFolderFallbackRules() {
+    return Check(ShouldUseDesktopFolderFallback(false, false, true),
+                 "unresolved desktop background should use the desktop folder") &&
+           Check(!ShouldUseDesktopFolderFallback(false, true, true),
+                 "unresolved desktop selection should not use the desktop folder") &&
+           Check(!ShouldUseDesktopFolderFallback(true, false, true),
+                 "resolved desktop target should not use the desktop fallback") &&
+           Check(!ShouldUseDesktopFolderFallback(false, false, false),
+                 "unresolved non-desktop target should not use the desktop fallback");
+}
+
 int main() {
     if (!TestInitializationLogIsVersionNeutral()) {
         return 1;
@@ -392,7 +403,10 @@ int main() {
     if (!TestDelayedMenuCommandKeepsState()) {
         return 1;
     }
+    if (!TestDesktopFolderFallbackRules()) {
+        return 1;
+    }
 
-    std::cout << "PASS: 16 tests\n";
+    std::cout << "PASS: 17 tests\n";
     return 0;
 }
