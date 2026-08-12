@@ -452,11 +452,22 @@ static bool TestExplorerContextMatchingUsesTabSpecificWindows() {
            Check(!IsExplorerContextMatch(view1, tab1, view2, tab1),
                  "a different shell view in the same frame should be rejected") &&
            Check(IsExplorerContextMatch(nullptr, tab1, nullptr, tab1),
-                 "navigation context should match its shell tab") &&
+                 "navigation context should match the tab derived from the active view") &&
            Check(!IsExplorerContextMatch(nullptr, tab1, nullptr, tab2),
-                 "navigation context should reject a different shell tab") &&
+                 "navigation context should reject a tab derived from another view") &&
            Check(IsExplorerContextMatch(nullptr, nullptr, nullptr, nullptr),
                  "systems without tab discriminators should retain frame matching");
+}
+
+static bool TestMenuInjectionRequiresReturnCommand() {
+    return Check(ShouldInjectForMenuFlags(TPM_RETURNCMD),
+                 "return-command menus should allow injection") &&
+           Check(ShouldInjectForMenuFlags(TPM_RETURNCMD | TPM_RIGHTBUTTON),
+                 "other flags should preserve return-command injection") &&
+           Check(!ShouldInjectForMenuFlags(0),
+                 "menus without TPM_RETURNCMD should fail closed") &&
+           Check(!ShouldInjectForMenuFlags(TPM_RIGHTBUTTON),
+                 "unrelated flags should not enable injection");
 }
 
 static bool TestDesktopFolderFallbackRules() {
@@ -537,10 +548,13 @@ int main() {
     if (!TestExplorerContextMatchingUsesTabSpecificWindows()) {
         return 1;
     }
+    if (!TestMenuInjectionRequiresReturnCommand()) {
+        return 1;
+    }
     if (!TestDesktopFolderFallbackRules()) {
         return 1;
     }
 
-    std::cout << "PASS: 23 tests\n";
+    std::cout << "PASS: 24 tests\n";
     return 0;
 }
