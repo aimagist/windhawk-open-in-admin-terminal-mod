@@ -5,6 +5,7 @@
 #include <vector>
 
 static std::vector<std::wstring> g_logFormats;
+static std::vector<void*> g_hookTargets;
 
 extern "C" PCWSTR Wh_GetStringSetting(PCWSTR) {
     return L"";
@@ -23,6 +24,7 @@ extern "C" void Wh_Log(PCWSTR format, ...) {
 extern "C" BOOL Wh_SetFunctionHook(void* targetFunction,
                                      void*,
                                      void** originalFunction) {
+    g_hookTargets.push_back(targetFunction);
     *originalFunction = targetFunction;
     return TRUE;
 }
@@ -43,6 +45,7 @@ static bool IsAbsolutePath(const std::wstring& path) {
 
 static bool TestInitializationLogIsVersionNeutral() {
     g_logFormats.clear();
+    g_hookTargets.clear();
 
     if (!Check(Wh_ModInit() == TRUE, "Wh_ModInit should succeed")) {
         return false;
@@ -50,7 +53,9 @@ static bool TestInitializationLogIsVersionNeutral() {
 
     bool passed = Check(!g_logFormats.empty(), "Wh_ModInit should log initialization") &&
                   Check(g_logFormats.front() == L"Init",
-                        "initialization log should be version-neutral");
+                        "initialization log should be version-neutral") &&
+                  Check(g_hookTargets.size() == 1,
+                        "initialization should hook only TrackPopupMenuEx");
     Wh_ModUninit();
     return passed;
 }
@@ -71,6 +76,26 @@ static bool TestCustomCommandReceivesSelectedFolder() {
                  "custom command should expand %V and %1") &&
            Check(spec.workingDirectory == L"C:\\Folder With Spaces",
                  "custom command should use the selected folder as working directory");
+}
+
+static bool TestCustomPlaceholderExpansionIsSinglePass() {
+    Settings settings{};
+    settings.terminalEffectiveChoice = L"custom";
+    settings.customTerminalCommand =
+        L"\"C:\\Tools\\terminal.exe\" --cwd \"%V\" --target %1";
+
+    LaunchSpec nestedPlaceholder =
+        BuildLaunchSpec(settings, L"C:\\Folder %1");
+
+    settings.customTerminalCommand =
+        L"\"C:\\Tools\\terminal.exe\" --cwd \"%V\"";
+    LaunchSpec driveRoot = BuildLaunchSpec(settings, L"C:\\");
+
+    return Check(nestedPlaceholder.parameters ==
+                     L"--cwd \"C:\\Folder %1\" --target \"C:\\Folder %1\"",
+                 "expanded target text should not be scanned for placeholders") &&
+           Check(driveRoot.parameters == L"--cwd C:\\",
+                 "quoted drive-root placeholders should not escape the closing quote");
 }
 
 static bool TestRelativeCustomCommandResolvesExecutable() {
@@ -385,13 +410,22 @@ static bool TestKeyboardContextMenuSentinel() {
                  "ordinary screen points should not use selection fallback");
 }
 
-static bool TestDelayedMenuCommandKeepsState() {
-    return Check(!ShouldClearMenuStateAfterTracking(0, TRUE),
-                 "successful posted-command menus should retain target state") &&
-           Check(ShouldClearMenuStateAfterTracking(0, FALSE),
-                 "canceled posted-command menus should clear target state") &&
-           Check(ShouldClearMenuStateAfterTracking(TPM_RETURNCMD, TRUE),
-                 "return-command menus should clear target state immediately");
+static bool TestExplorerContextMatchingUsesTabSpecificWindows() {
+    HWND view1 = reinterpret_cast<HWND>(static_cast<UINT_PTR>(1));
+    HWND view2 = reinterpret_cast<HWND>(static_cast<UINT_PTR>(2));
+    HWND tab1 = reinterpret_cast<HWND>(static_cast<UINT_PTR>(3));
+    HWND tab2 = reinterpret_cast<HWND>(static_cast<UINT_PTR>(4));
+
+    return Check(IsExplorerContextMatch(view1, tab1, view1, tab1),
+                 "the requested shell view should match itself") &&
+           Check(!IsExplorerContextMatch(view1, tab1, view2, tab1),
+                 "a different shell view in the same frame should be rejected") &&
+           Check(IsExplorerContextMatch(nullptr, tab1, nullptr, tab1),
+                 "navigation context should match its shell tab") &&
+           Check(!IsExplorerContextMatch(nullptr, tab1, nullptr, tab2),
+                 "navigation context should reject a different shell tab") &&
+           Check(IsExplorerContextMatch(nullptr, nullptr, nullptr, nullptr),
+                 "systems without tab discriminators should retain frame matching");
 }
 
 static bool TestDesktopFolderFallbackRules() {
@@ -410,6 +444,9 @@ int main() {
         return 1;
     }
     if (!TestCustomCommandReceivesSelectedFolder()) {
+        return 1;
+    }
+    if (!TestCustomPlaceholderExpansionIsSinglePass()) {
         return 1;
     }
     if (!TestRelativeCustomCommandResolvesExecutable()) {
@@ -460,13 +497,13 @@ int main() {
     if (!TestKeyboardContextMenuSentinel()) {
         return 1;
     }
-    if (!TestDelayedMenuCommandKeepsState()) {
+    if (!TestExplorerContextMatchingUsesTabSpecificWindows()) {
         return 1;
     }
     if (!TestDesktopFolderFallbackRules()) {
         return 1;
     }
 
-    std::cout << "PASS: 20 tests\n";
+    std::cout << "PASS: 21 tests\n";
     return 0;
 }
