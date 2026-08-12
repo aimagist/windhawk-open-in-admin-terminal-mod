@@ -410,6 +410,37 @@ static bool TestKeyboardContextMenuSentinel() {
                  "ordinary screen points should not use selection fallback");
 }
 
+static bool TestNavigationPaneWindowUsesControlBeforeFallback() {
+    HWND control = reinterpret_cast<HWND>(static_cast<UINT_PTR>(1));
+    HWND fallback = reinterpret_cast<HWND>(static_cast<UINT_PTR>(2));
+
+    return Check(SelectNavigationPaneWindow(control, fallback) == control,
+                 "the navigation control should provide its own coordinate window") &&
+           Check(SelectNavigationPaneWindow(nullptr, fallback) == fallback,
+                 "FCW_TREE should remain a fallback for older Explorer versions");
+}
+
+static bool TestMenuCommandIdsAvoidExistingEntries() {
+    HMENU menu = CreatePopupMenu();
+    if (!Check(menu != nullptr, "a popup menu should be created")) {
+        return false;
+    }
+
+    InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING,
+                kPreferredAdminMenuCommandId, L"existing");
+    UINT admin = ReserveMenuCommandId(menu, kPreferredAdminMenuCommandId);
+    UINT nonElevated = ReserveMenuCommandId(
+        menu, kPreferredNonElevatedMenuCommandId, admin);
+    DestroyMenu(menu);
+
+    return Check(kPreferredAdminMenuCommandId != 0xBF31,
+                 "command IDs should not overlap the catalog custom-items mod") &&
+           Check(admin == kPreferredAdminMenuCommandId + 1,
+                 "an occupied preferred ID should be skipped") &&
+           Check(nonElevated != admin && nonElevated != 0,
+                 "both inserted actions should have distinct available IDs");
+}
+
 static bool TestExplorerContextMatchingUsesTabSpecificWindows() {
     HWND view1 = reinterpret_cast<HWND>(static_cast<UINT_PTR>(1));
     HWND view2 = reinterpret_cast<HWND>(static_cast<UINT_PTR>(2));
@@ -497,6 +528,12 @@ int main() {
     if (!TestKeyboardContextMenuSentinel()) {
         return 1;
     }
+    if (!TestNavigationPaneWindowUsesControlBeforeFallback()) {
+        return 1;
+    }
+    if (!TestMenuCommandIdsAvoidExistingEntries()) {
+        return 1;
+    }
     if (!TestExplorerContextMatchingUsesTabSpecificWindows()) {
         return 1;
     }
@@ -504,6 +541,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "PASS: 21 tests\n";
+    std::cout << "PASS: 23 tests\n";
     return 0;
 }
