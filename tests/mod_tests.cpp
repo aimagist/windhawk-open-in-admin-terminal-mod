@@ -54,8 +54,12 @@ static bool TestInitializationLogIsVersionNeutral() {
     bool passed = Check(!g_logFormats.empty(), "Wh_ModInit should log initialization") &&
                   Check(g_logFormats.front() == L"Init",
                         "initialization log should be version-neutral") &&
-                  Check(g_hookTargets.size() == 1,
-                        "initialization should hook only TrackPopupMenuEx");
+                  Check(g_hookTargets.size() == 2,
+                        "initialization should hook TrackPopupMenuEx and TrackPopupMenu") &&
+                  Check(g_hookTargets[0] == reinterpret_cast<void*>(TrackPopupMenuEx),
+                        "the first hook should target TrackPopupMenuEx") &&
+                  Check(g_hookTargets[1] == reinterpret_cast<void*>(TrackPopupMenu),
+                        "the second hook should target TrackPopupMenu");
     Wh_ModUninit();
     return passed;
 }

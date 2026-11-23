@@ -2,7 +2,7 @@
 // @id              open-in-admin-terminal
 // @name            Open in Admin Terminal
 // @description     Adds Explorer classic context menu entries to open a terminal (elevated or not) in the current or selected folder, and to run script files.
-// @version         1.17.1
+// @version         1.17.2
 // @author          aimagist
 // @github          https://github.com/aimagist
 // @include         explorer.exe
@@ -53,6 +53,7 @@ Screenshots may show earlier builds, but current releases use runtime classic-me
 - Diagnostics use Windhawk's built-in logging controls.
 
 ## Version log
+- 1.17.2: Fix the entry missing on Windows 11 builds where File Explorer opens its classic context menu with `TrackPopupMenu` instead of `TrackPopupMenuEx`: both are now hooked, with a guard so the entry is only added once. Also fall back to asking the Explorer window for its browser when the window is missing from ShellWindows.
 - 1.17.1: Fix navigation pane menu not appearing: the entry was missing when right-clicking folders or drives in File Explorer’s left sidebar and Quick access. Now it works :)
 - 1.17: Added optional non-elevated terminal entries, configurable normal/elevated script actions (.ps1/.bat/.cmd/.vbs/.js), and shorter script labels. The two extra entry features are opt-in and disabled by default; terminal names remain shown in script entries by default for compatibility.
 - 1.16: Added native UAC shield overlay composition on the terminal menu icon using `SHGetStockIconInfo(SIID_SHIELD)`.
@@ -235,6 +236,14 @@ static std::vector<MenuBitmapCacheEntry> g_menuBitmapCache;
 
 using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
 static TrackPopupMenuEx_t TrackPopupMenuEx_Orig;
+
+using TrackPopupMenu_t = BOOL(WINAPI*)(HMENU, UINT, int, int, int, HWND,
+                                       const RECT*);
+static TrackPopupMenu_t TrackPopupMenu_Orig;
+
+#ifndef CWM_GETISHELLBROWSER
+#define CWM_GETISHELLBROWSER (WM_USER + 7)
+#endif
 
 static std::wstring GetSettingString(PCWSTR name, const wchar_t* fallback) {
     std::wstring value = fallback;
@@ -981,6 +990,48 @@ static bool ShouldInjectForMenuFlags(UINT flags) {
     return (flags & TPM_RETURNCMD) != 0;
 }
 
+// CWM_GETISHELLBROWSER is answered in-process by Explorer's tab and frame
+// windows, and returns an IShellBrowser that is not AddRef'd. It's only sent to
+// the known Explorer browser window classes of this process, where the message
+// has that meaning. The returned browser is AddRef'd by QueryInterface.
+static IShellBrowser* GetShellBrowserFromWindowMessage(HWND hwnd) {
+    HWND candidates[] = {FindShellTabWindow(hwnd), GetAncestor(hwnd, GA_ROOT)};
+    for (HWND w : candidates) {
+        if (!w) {
+            continue;
+        }
+
+        WCHAR className[64] = {};
+        GetClassNameW(w, className, ARRAYSIZE(className));
+        if (_wcsicmp(className, L"ShellTabWindowClass") != 0 &&
+            _wcsicmp(className, L"CabinetWClass") != 0 &&
+            _wcsicmp(className, L"ExploreWClass") != 0) {
+            continue;
+        }
+
+        DWORD processId = 0;
+        GetWindowThreadProcessId(w, &processId);
+        if (processId != GetCurrentProcessId()) {
+            continue;
+        }
+
+        DWORD_PTR raw = 0;
+        if (!SendMessageTimeoutW(w, CWM_GETISHELLBROWSER, 0, 0,
+                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &raw) ||
+            !raw) {
+            continue;
+        }
+
+        IShellBrowser* browser = nullptr;
+        if (SUCCEEDED(reinterpret_cast<IUnknown*>(raw)->QueryInterface(
+                IID_IShellBrowser, reinterpret_cast<void**>(&browser))) &&
+            browser) {
+            return browser;
+        }
+    }
+    return nullptr;
+}
+
 static IServiceProvider* GetExplorerServiceProviderForHwnd(HWND hwnd) {
     HWND topLevel = GetAncestor(hwnd, GA_ROOT);
     if (!topLevel) {
@@ -994,11 +1045,15 @@ static IServiceProvider* GetExplorerServiceProviderForHwnd(HWND hwnd) {
                                   IID_IShellWindows,
                                   reinterpret_cast<void**>(&shellWindows));
     if (FAILED(hr) || !shellWindows) {
-        return nullptr;
+        Wh_Log(L"CoCreateInstance(ShellWindows) failed hr=0x%08X",
+               static_cast<unsigned>(hr));
+        shellWindows = nullptr;
     }
 
     long count = 0;
-    shellWindows->get_Count(&count);
+    if (shellWindows) {
+        shellWindows->get_Count(&count);
+    }
 
     IServiceProvider* result = nullptr;
     for (long i = 0; i < count && !result; i++) {
@@ -1058,7 +1113,37 @@ static IServiceProvider* GetExplorerServiceProviderForHwnd(HWND hwnd) {
         dispatch->Release();
     }
 
-    shellWindows->Release();
+    if (shellWindows) {
+        shellWindows->Release();
+    }
+
+    if (!result) {
+        // Newer Windows 11 builds don't always register every Explorer window
+        // or tab in ShellWindows (or register it late). Ask the tab or frame
+        // window for its browser directly, then verify that it's the browser
+        // which owns the view the menu was opened from.
+        IShellBrowser* shellBrowser = GetShellBrowserFromWindowMessage(hwnd);
+        if (shellBrowser) {
+            HWND candidateShellView = nullptr;
+            HWND candidateShellTab = nullptr;
+            IShellView* shellView = nullptr;
+            if (SUCCEEDED(shellBrowser->QueryActiveShellView(&shellView)) &&
+                shellView) {
+                shellView->GetWindow(&candidateShellView);
+                candidateShellTab = FindShellTabWindow(candidateShellView);
+                shellView->Release();
+            }
+            if (IsExplorerContextMatch(expectedShellView, expectedShellTab,
+                                       candidateShellView, candidateShellTab)) {
+                shellBrowser->QueryInterface(IID_IServiceProvider,
+                                             reinterpret_cast<void**>(&result));
+            }
+            Wh_Log(L"ShellWindows had no match, window message fallback %ls",
+                   result ? L"succeeded" : L"did not match");
+            shellBrowser->Release();
+        }
+    }
+
     return result;
 }
 
@@ -2173,12 +2258,26 @@ static void LaunchTerminalNonElevated(const MenuTarget& target) {
     }
 }
 
-BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
-                                  UINT flags,
-                                  int x,
-                                  int y,
-                                  HWND hwnd,
-                                  LPTPMPARAMS params) {
+// Set while one of the hooks is inside the original popup call, so that if a
+// Windows build implements TrackPopupMenu through TrackPopupMenuEx (or the
+// reverse), the entry is only added once, by the outer call.
+static thread_local bool t_inPopupHook = false;
+
+// File Explorer shows its classic context menu through either popup function,
+// depending on the Windows build. Some current Windows 11 builds use the plain
+// TrackPopupMenu, which doesn't go through TrackPopupMenuEx in user32, so both
+// are hooked and share this code.
+template <typename Track>
+static BOOL TrackPopupWithInjection(HMENU menu,
+                                    UINT flags,
+                                    int x,
+                                    int y,
+                                    HWND hwnd,
+                                    Track track) {
+    if (t_inPopupHook) {
+        return track();
+    }
+
     bool injected = false;
     MenuTarget target;
     MenuCommandIds commandIds;
@@ -2221,7 +2320,9 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
         }
     }
 
-    BOOL result = TrackPopupMenuEx_Orig(menu, flags, x, y, hwnd, params);
+    t_inPopupHook = true;
+    BOOL result = track();
+    t_inPopupHook = false;
 
     if (injected && (flags & TPM_RETURNCMD) &&
         commandIds.admin && static_cast<UINT>(result) == commandIds.admin) {
@@ -2237,6 +2338,29 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
     }
 
     return result;
+}
+
+BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu,
+                                  UINT flags,
+                                  int x,
+                                  int y,
+                                  HWND hwnd,
+                                  LPTPMPARAMS params) {
+    return TrackPopupWithInjection(menu, flags, x, y, hwnd, [&] {
+        return TrackPopupMenuEx_Orig(menu, flags, x, y, hwnd, params);
+    });
+}
+
+BOOL WINAPI TrackPopupMenu_Hook(HMENU menu,
+                                UINT flags,
+                                int x,
+                                int y,
+                                int reserved,
+                                HWND hwnd,
+                                const RECT* rect) {
+    return TrackPopupWithInjection(menu, flags, x, y, hwnd, [&] {
+        return TrackPopupMenu_Orig(menu, flags, x, y, reserved, hwnd, rect);
+    });
 }
 
 BOOL Wh_ModInit() {
@@ -2258,14 +2382,24 @@ BOOL Wh_ModInit() {
            g_settings.position.c_str());
     ReleaseSRWLockExclusive(&g_settingsLock);
 
-    if (!Wh_SetFunctionHook(reinterpret_cast<void*>(TrackPopupMenuEx),
-                            reinterpret_cast<void*>(TrackPopupMenuEx_Hook),
-                            reinterpret_cast<void**>(&TrackPopupMenuEx_Orig))) {
+    // Either hook alone keeps the mod working on the builds that use it.
+    bool hookedTrackPopupMenuEx = Wh_SetFunctionHook(
+        reinterpret_cast<void*>(TrackPopupMenuEx),
+        reinterpret_cast<void*>(TrackPopupMenuEx_Hook),
+        reinterpret_cast<void**>(&TrackPopupMenuEx_Orig));
+    if (!hookedTrackPopupMenuEx) {
         Wh_Log(L"Failed to hook TrackPopupMenuEx");
-        return FALSE;
     }
 
-    return TRUE;
+    bool hookedTrackPopupMenu = Wh_SetFunctionHook(
+        reinterpret_cast<void*>(TrackPopupMenu),
+        reinterpret_cast<void*>(TrackPopupMenu_Hook),
+        reinterpret_cast<void**>(&TrackPopupMenu_Orig));
+    if (!hookedTrackPopupMenu) {
+        Wh_Log(L"Failed to hook TrackPopupMenu");
+    }
+
+    return (hookedTrackPopupMenuEx || hookedTrackPopupMenu) ? TRUE : FALSE;
 }
 
 void Wh_ModUninit() {
